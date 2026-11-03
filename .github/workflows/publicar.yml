@@ -49,7 +49,8 @@ jobs:
         run: |
           supabase functions deploy "$FUNCAO" \
             --project-ref "$PROJETO" \
-            --no-verify-jwt
+            --no-verify-jwt \
+            --yes
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
