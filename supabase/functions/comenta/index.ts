@@ -1,0 +1,2107 @@
+// Comenta e Recebe - CAU/RS - v2.4
+// Edge Function unica: webhook da Meta, link curto, API do painel, usuarios,
+// sincronizacao de publicacoes e metricas, e o painel.
+
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+const APP_SECRET = Deno.env.get('IG_APP_SECRET') ?? '';
+const ACCESS_TOKEN = Deno.env.get('IG_ACCESS_TOKEN') ?? '';
+const VERIFY_TOKEN = Deno.env.get('WEBHOOK_VERIFY_TOKEN') ?? '';
+const CHAVE_PUBLICA = 'sb_publishable_coPqTBtBYTVSk36gdbe58Q_f2K9Llro';
+const VERSAO = '2.4';
+
+const SETE_DIAS = 7 * 24 * 60 * 60;
+const DESDE = '2026-01-01T00:00:00+0000';
+const JANELA_CLIQUE = 90;
+
+const HOSTS = ['https://graph.facebook.com', 'https://graph.instagram.com'];
+
+function limparRota(pathname: string) {
+  let r = pathname;
+  r = r.replace(/^\/functions\/v1/, '');
+  r = r.replace(/^\/comenta/, '');
+  return r || '/';
+}
+
+Deno.serve(async (req) => {
+  const url = new URL(req.url);
+  const rota = limparRota(url.pathname);
+  const base = req.headers.get('x-encaminhado-de') ?? url.origin;
+
+  if (rota === '/' || rota === '/saude') return txt('Comenta e Recebe: no ar');
+  if (rota === '/painel') return html(await pagina());
+  if (rota === '/webhook') {
+    if (req.method === 'GET') return verificar(url);
+    if (req.method === 'POST') return receber(req, base);
+    return txt('Metodo nao permitido', 405);
+  }
+  if (rota.startsWith('/r/')) return linkCurto(rota.slice(3), req);
+  if (rota === '/api/publicacoes') return apiPublicacoes(req);
+  if (rota === '/api/sincronizar') return apiSincronizar(req, url);
+  if (rota === '/api/usuarios') return apiUsuarios(req);
+
+  return txt('Nao encontrado: ' + rota, 404);
+});
+
+/* ------------------------------------------------------------- webhook */
+
+function verificar(url: URL) {
+  if (url.searchParams.get('hub.mode') === 'subscribe'
+      && url.searchParams.get('hub.verify_token') === VERIFY_TOKEN) {
+    return txt(url.searchParams.get('hub.challenge') ?? '');
+  }
+  return txt('Token de verificacao invalido', 403);
+}
+
+async function receber(req: Request, base: string) {
+  const corpo = await req.text();
+  if (!(await confere(corpo, req.headers.get('x-hub-signature-256')))) {
+    await log(corpo, false, 'assinatura invalida');
+    return txt('Assinatura invalida', 403);
+  }
+  const idLog = await log(corpo, true, null);
+  let payload: any;
+  try { payload = JSON.parse(corpo); } catch { return txt('EVENT_RECEIVED'); }
+  processar(payload, idLog, base).catch((e) => console.error('processar:', e.message));
+  return txt('EVENT_RECEIVED');
+}
+
+async function confere(corpo: string, cabecalho: string | null) {
+  if (!cabecalho?.startsWith('sha256=') || !APP_SECRET) return false;
+  const chave = await crypto.subtle.importKey('raw', new TextEncoder().encode(APP_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const bytes = await crypto.subtle.sign('HMAC', chave, new TextEncoder().encode(corpo));
+  const calc = [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const recebida = cabecalho.slice(7);
+  if (calc.length !== recebida.length) return false;
+  let d = 0;
+  for (let i = 0; i < calc.length; i++) d |= calc.charCodeAt(i) ^ recebida.charCodeAt(i);
+  return d === 0;
+}
+
+/* -------------------------------------------------------- processamento */
+
+async function processar(payload: any, idLog: number | null, base: string) {
+  try {
+    const [contas, config, testadores] = await Promise.all([
+      sb('ig_conta?select=ig_user_id&limit=1'),
+      sb('configuracoes?select=chave,valor&chave=in.(page_id,modo_teste,versao_graph_api)'),
+      sb('testadores?select=username'),
+    ]);
+    const ajustes: Record<string, any> = Object.fromEntries(config.map((c: any) => [c.chave, c.valor]));
+    const ctx = {
+      conta: contas[0],
+      pageId: ajustes.page_id || null,
+      modoTeste: ajustes.modo_teste === true,
+      versao: ajustes.versao_graph_api || 'v26.0',
+      permitidos: new Set(testadores.map((t: any) => (t.username || '').toLowerCase())),
+      base,
+    };
+    for (const entrada of payload.entry ?? []) {
+      for (const mud of entrada.changes ?? []) {
+        if (mud.field !== 'comments') continue;
+        await comentario(mud.value, entrada.time, ctx);
+      }
+    }
+    if (idLog) await patch(`webhook_log?id=eq.${idLog}`, { processado: true });
+  } catch (e: any) {
+    if (idLog) await patch(`webhook_log?id=eq.${idLog}`, { erro: e.message });
+  }
+}
+
+async function comentario(v: any, tempo: number, ctx: any) {
+  const id = v.id;
+  if (!id) return;
+  if (ctx.conta && v.from?.id === ctx.conta.ig_user_id) return;
+
+  const comum = {
+    comment_id: id, media_id: v.media?.id ?? null,
+    ig_usuario_id: v.from?.id ?? null, username: v.from?.username ?? null,
+    texto_comentario: v.text ?? '',
+    comentado_em: tempo ? new Date(tempo * 1000).toISOString() : null,
+  };
+
+  if (tempo && Math.floor(Date.now() / 1000) - tempo > SETE_DIAS) {
+    await inserir({ ...comum, status: 'expirado' });
+    return;
+  }
+
+  const regra = await acharRegra(v.media?.id ?? null, v.text ?? '', ctx.versao);
+  if (!regra) {
+    await inserir({ ...comum, status: 'ignorado' });
+    return;
+  }
+
+  if (ctx.modoTeste && !ctx.permitidos.has((v.from?.username ?? '').toLowerCase())) {
+    await inserir({ ...comum, regra_id: regra.id, status: 'ignorado',
+      erro: 'modo de teste: conta nao cadastrada como testadora' });
+    return;
+  }
+
+  if (!(await inserir({ ...comum, regra_id: regra.id, status: 'recebido' }))) return;
+
+  const envio = await enviarDm(ctx, id, regra);
+
+  await patch(`disparos?comment_id=eq.${encodeURIComponent(id)}`, {
+    status: envio.status, erro: envio.erro,
+    enviado_em: envio.status === 'enviado' ? new Date().toISOString() : null, tentativas: 1,
+  });
+
+  const publico = envio.status === 'enviado' ? regra.resposta_publica : regra.resposta_publica_recusa;
+  if (publico) await meta(ctx.versao, `/${id}/replies`, { message: publico });
+}
+
+const CAMPOS_REGRA = 'id,nome,alvo,media_id,palavras_chave,mensagem_dm,link,codigo_curto,rotulo_botao,resposta_publica,resposta_publica_recusa,inicio,fim,criado_em';
+
+async function acharRegra(mediaId: string | null, texto: string, versao: string) {
+  if (mediaId) {
+    const presas = await sb(`regras?select=${CAMPOS_REGRA}&ativa=is.true&media_id=eq.${encodeURIComponent(mediaId)}`);
+    const achou = casar(presas, texto);
+    if (achou) return achou;
+
+    const agendadas = await sb(`regras?select=${CAMPOS_REGRA}&ativa=is.true&alvo=eq.proxima&media_id=is.null`);
+    if (agendadas.length) {
+      const quando = await dataDaPublicacao(versao, mediaId);
+      for (const r of agendadas) {
+        if (quando && quando > new Date(r.criado_em).getTime()) {
+          await patch(`regras?id=eq.${r.id}`, { media_id: mediaId });
+          r.media_id = mediaId;
+          const casou = casar([r], texto);
+          if (casou) return casou;
+        }
+      }
+    }
+  }
+  const gerais = await sb(`regras?select=${CAMPOS_REGRA}&ativa=is.true&alvo=eq.qualquer`);
+  return casar(gerais, texto);
+}
+
+function casar(lista: any[], texto: string) {
+  const alvo = normalizar(texto);
+  const agora = new Date().toISOString();
+  return lista.find((r) => {
+    if (r.inicio && r.inicio > agora) return false;
+    if (r.fim && r.fim < agora) return false;
+    return (r.palavras_chave ?? []).some((p: string) => alvo.includes(normalizar(p)));
+  }) ?? null;
+}
+
+async function dataDaPublicacao(versao: string, mediaId: string) {
+  const r = await meta(versao, `/${mediaId}?fields=timestamp`);
+  if (!r.ok) return null;
+  try { return new Date(JSON.parse(r.texto).timestamp).getTime(); } catch { return null; }
+}
+
+function normalizar(s: string) {
+  return (s || '').toLowerCase().normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/* ------------------------------------------------------------ API Meta */
+
+/**
+ * Tenta os dois hosts e guarda TODAS as falhas. Guardar so a ultima escondia
+ * justamente o erro do host que importa, e isso custou duas rodadas de chute.
+ */
+async function meta(versao: string, caminho: string, corpo?: unknown, token?: string | null) {
+  const usar = token || ACCESS_TOKEN;
+  const falhas: string[] = [];
+  for (const host of HOSTS) {
+    try {
+      const r = await fetch(`${host}/${versao}${caminho}`, {
+        method: corpo ? 'POST' : 'GET',
+        headers: { authorization: `Bearer ${usar}`,
+          ...(corpo ? { 'content-type': 'application/json' } : {}) },
+        body: corpo ? JSON.stringify(corpo) : undefined,
+      });
+      const texto = await r.text();
+      if (r.ok) return { ok: true, texto, host, falhas };
+      falhas.push(`${host}: ${texto.slice(0, 220)}`);
+    } catch (e: any) { falhas.push(`${host}: ${e.message}`); }
+  }
+  return { ok: false, texto: falhas.join(' | '), host: '', falhas };
+}
+
+async function metaUrl(url: string, token?: string | null) {
+  try {
+    const r = await fetch(url, { headers: { authorization: `Bearer ${token || ACCESS_TOKEN}` } });
+    const texto = await r.text();
+    return { ok: r.ok, texto };
+  } catch (e: any) { return { ok: false, texto: e.message }; }
+}
+
+/**
+ * A Send API exige token DA PAGINA, nao o de usuario do sistema que esta no
+ * ambiente. Os dois servem para leitura; so o envio distingue, e quando o tipo
+ * esta errado a Meta responde com o code 1 generico, sem dizer o motivo.
+ */
+let tokenPaginaCache: string | null = null;
+async function tokenDaPagina(versao: string, pageId: string | null) {
+  if (!pageId) return null;
+  if (tokenPaginaCache) return tokenPaginaCache;
+  const r = await meta(versao, `/${pageId}?fields=access_token`);
+  if (!r.ok) return null;
+  try {
+    const t = JSON.parse(r.texto).access_token;
+    if (t) { tokenPaginaCache = t; return t; }
+  } catch { /* usa o do ambiente */ }
+  return null;
+}
+
+/**
+ * A API nao aceita formatacao: o corpo e um campo de texto puro, com limite de
+ * 1000 bytes em UTF-8. Nao existe negrito, italico nem tachado, e marcador
+ * digitado chegaria literal para quem comenta. Quebra de linha e emoji, sim.
+ *
+ * Por isso o unico tratamento aqui e tirar o [link] no modo botao e fechar o
+ * buraco que ele deixa. Colapsa SO espaco horizontal: colapsar \s pegava a
+ * quebra de linha junto e desmanchava os paragrafos da mensagem.
+ */
+function textoDaMensagem(bruto: string, rotulo: string, link: string) {
+  if (!rotulo) return (bruto ?? '').replace(/\[link\]/gi, link);
+  return (bruto ?? '')
+    .replace(/\[link\]/gi, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .split('\n').map((l) => l.replace(/[ \t]+$/, '')).join('\n')
+    .trim();
+}
+
+/**
+ * Dois formatos de DM, escolhidos pelo rotulo do botao estar preenchido:
+ *   com rotulo -> template de botao, apontando para o link curto (mede clique)
+ *   sem rotulo -> texto com o link ORIGINAL a mostra (nao mede)
+ * O template de botao nao funciona na versao web do Instagram.
+ */
+async function enviarDm(ctx: any, commentId: string, regra: any) {
+  const destino = ctx.pageId ?? ctx.conta?.ig_user_id;
+  const tokenPg = await tokenDaPagina(ctx.versao, ctx.pageId);
+  const marca = tokenPg ? '[token da pagina]' : '[token do sistema]';
+
+  const rotulo = (regra.rotulo_botao ?? '').trim();
+  const curto = regra.codigo_curto ? `${ctx.base}/r/${regra.codigo_curto}` : regra.link;
+  const texto = textoDaMensagem(regra.mensagem_dm, rotulo, regra.link);
+
+  const message = rotulo
+    ? { attachment: { type: 'template', payload: { template_type: 'button',
+        text: texto,
+        buttons: [{ type: 'web_url', url: curto, title: rotulo.slice(0, 20) }] } } }
+    : { text: texto };
+
+  const r = await meta(ctx.versao, `/${destino}/messages`,
+    { recipient: { comment_id: commentId }, message }, tokenPg);
+
+  if (r.ok) return { status: 'enviado', erro: null };
+  const t = String(r.texto).toLowerCase();
+  const recusa = t.includes('2534041') || t.includes('not allowed to message') || t.includes('policy');
+  return { status: recusa ? 'recusado' : 'erro',
+    erro: `${marca} ${String(r.texto)}`.slice(0, 600) };
+}
+
+/* ---------------------------------------------------- API para o painel */
+
+async function quemE(req: Request) {
+  const jwt = (req.headers.get('authorization') ?? '').replace('Bearer ', '');
+  if (!jwt) return null;
+  const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { apikey: CHAVE_PUBLICA, authorization: `Bearer ${jwt}` },
+  });
+  if (!r.ok) return null;
+  try { return await r.json(); } catch { return null; }
+}
+
+async function souAdministrador(usuario: any) {
+  if (!usuario) return false;
+  const p = await sb(`perfis?select=papel&id=eq.${usuario.id}&limit=1`);
+  return p[0]?.papel === 'administrador';
+}
+
+async function apiPublicacoes(req: Request) {
+  if (!(await quemE(req))) return json({ erro: 'sessao invalida' }, 401);
+
+  const contas = await sb('ig_conta?select=ig_user_id&limit=1');
+  if (!contas[0]) return json({ erro: 'conta do Instagram nao cadastrada' }, 500);
+
+  const campos = 'id,permalink,media_type,media_url,thumbnail_url,caption,timestamp';
+  const sufixo = `/media?fields=${campos}&limit=30`;
+  const guardado = await sb(`configuracoes?select=valor&chave=eq.rota_media&limit=1`)
+    .then((r: any[]) => r[0]?.valor).catch(() => null);
+  const caminhos = guardado ? [guardado, `/${contas[0].ig_user_id}`, '/me']
+    : [`/${contas[0].ig_user_id}`, '/me'];
+
+  const tentativas: string[] = [];
+  for (const prefixo of [...new Set(caminhos)]) {
+    const r = await meta('v26.0', prefixo + sufixo);
+    if (r.ok) {
+      if (guardado !== prefixo) await guardar('rota_media', prefixo);
+      const dados = JSON.parse(r.texto);
+      return json((dados.data ?? []).map((m: any) => ({
+        media_id: m.id, permalink: m.permalink, tipo: m.media_type,
+        miniatura: m.thumbnail_url || m.media_url,
+        legenda: (m.caption ?? '').slice(0, 90), data: m.timestamp,
+      })));
+    }
+    tentativas.push(`${prefixo} -> ${r.texto}`);
+  }
+  return json({ erro: 'a Meta recusou todas as formas', tentativas }, 502);
+}
+
+/* ------------------------------------------------------------ usuarios */
+
+const ADJ = ['arara','telha','cedro','barro','vidro','pedra','viga','porta','janela','patio','beiral','taipa','adobe','junco','seixo'];
+
+function senhaProvisoria() {
+  const n = new Uint32Array(3);
+  crypto.getRandomValues(n);
+  return `${ADJ[n[0] % ADJ.length]}-${ADJ[n[1] % ADJ.length]}-${1000 + (n[2] % 9000)}`;
+}
+
+const admAuth = { 'content-type': 'application/json', apikey: SERVICE_KEY,
+  authorization: `Bearer ${SERVICE_KEY}` };
+
+/**
+ * Criar, remover e trocar senha exigem a chave de servico, que nunca pode ir
+ * para o navegador. Por isso passam por aqui, com o papel conferido a cada
+ * chamada: o painel esconder um botao nao e seguranca.
+ */
+async function apiUsuarios(req: Request) {
+  const usuario = await quemE(req);
+  if (!usuario) return json({ erro: 'sessao invalida' }, 401);
+
+  if (req.method === 'GET') {
+    const [perfis, contas] = await Promise.all([
+      sb('perfis?select=id,nome,email,papel,trocar_senha&order=nome'),
+      fetch(`${SUPABASE_URL}/auth/v1/admin/users?per_page=200`, { headers: admAuth })
+        .then((r) => r.ok ? r.json() : { users: [] }).catch(() => ({ users: [] })),
+    ]);
+    const acessos: Record<string, any> = {};
+    for (const u of contas.users ?? []) acessos[u.id] = u.last_sign_in_at;
+    return json(perfis.map((p: any) => ({ ...p, ultimo_acesso: acessos[p.id] ?? null })));
+  }
+
+  let corpo: any = {};
+  try { corpo = await req.json(); } catch { /* vazio */ }
+  const admin = await souAdministrador(usuario);
+
+  // Trocar o proprio nome nao exige ser administrador; o resto exige.
+  const soMeuNome = req.method === 'PATCH' && corpo.acao === 'nome' && corpo.id === usuario.id;
+  if (!admin && !soMeuNome) {
+    return json({ erro: 'so administrador pode gerir pessoas' }, 403);
+  }
+
+  if (req.method === 'POST') {
+    const email = String(corpo.email ?? '').trim().toLowerCase();
+    const nome = String(corpo.nome ?? '').trim();
+    const papel = corpo.papel === 'administrador' ? 'administrador' : 'editor';
+    if (!email || !nome) return json({ erro: 'nome e e-mail sao obrigatorios' }, 400);
+
+    const senha = senhaProvisoria();
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/users`, {
+      method: 'POST', headers: admAuth,
+      body: JSON.stringify({ email, password: senha, email_confirm: true,
+        user_metadata: { nome } }),
+    });
+    const feito = await r.json().catch(() => ({}));
+    if (!r.ok) return json({ erro: feito.msg || feito.message || 'nao foi possivel criar' }, 400);
+
+    await upsert('perfis?on_conflict=id',
+      [{ id: feito.id, nome, email, papel, trocar_senha: true }]);
+    return json({ id: feito.id, nome, email, papel, senha });
+  }
+
+  if (req.method === 'PATCH') {
+    const id = String(corpo.id ?? '');
+    if (!id) return json({ erro: 'id obrigatorio' }, 400);
+
+    if (corpo.acao === 'nome') {
+      const nome = String(corpo.nome ?? '').trim();
+      if (nome.length < 2) return json({ erro: 'o nome precisa de pelo menos 2 letras' }, 400);
+      if (nome.length > 80) return json({ erro: 'o nome ficou longo demais' }, 400);
+      await patch(`perfis?id=eq.${id}`, { nome });
+      // Espelha no cadastro de autenticacao, para os dois nao divergirem.
+      await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${id}`, {
+        method: 'PUT', headers: admAuth,
+        body: JSON.stringify({ user_metadata: { nome } }),
+      }).catch(() => null);
+      return json({ nome });
+    }
+    if (corpo.acao === 'senha') {
+      const senha = senhaProvisoria();
+      const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${id}`, {
+        method: 'PUT', headers: admAuth, body: JSON.stringify({ password: senha }),
+      });
+      if (!r.ok) return json({ erro: 'nao foi possivel trocar a senha' }, 400);
+      await patch(`perfis?id=eq.${id}`, { trocar_senha: true });
+      return json({ senha });
+    }
+    if (corpo.acao === 'papel') {
+      const papel = corpo.papel === 'administrador' ? 'administrador' : 'editor';
+      if (id === usuario.id && papel !== 'administrador') {
+        return json({ erro: 'voce nao pode rebaixar a propria conta' }, 400);
+      }
+      await patch(`perfis?id=eq.${id}`, { papel });
+      return json({ papel });
+    }
+    return json({ erro: 'acao desconhecida' }, 400);
+  }
+
+  if (req.method === 'DELETE') {
+    const id = String(corpo.id ?? '');
+    if (!id) return json({ erro: 'id obrigatorio' }, 400);
+    if (id === usuario.id) return json({ erro: 'voce nao pode excluir a propria conta' }, 400);
+    const admins = await sb("perfis?select=id&papel=eq.administrador");
+    if (admins.length <= 1 && admins.some((p: any) => p.id === id)) {
+      return json({ erro: 'o sistema ficaria sem administrador' }, 400);
+    }
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${id}`,
+      { method: 'DELETE', headers: admAuth });
+    if (!r.ok) return json({ erro: 'nao foi possivel excluir' }, 400);
+    return json({ ok: true });
+  }
+
+  return json({ erro: 'metodo nao permitido' }, 405);
+}
+
+/* ------------------------------------------- sincronizacao da fase 2 */
+
+async function apiSincronizar(req: Request, url: URL) {
+  const usuario = await quemE(req);
+  if (!usuario) return json({ erro: 'sessao invalida' }, 401);
+  if (!(await souAdministrador(usuario))) {
+    return json({ erro: 'so administrador pode sincronizar' }, 403);
+  }
+
+  const contas = await sb('ig_conta?select=ig_user_id&limit=1');
+  if (!contas[0]) return json({ erro: 'conta do Instagram nao cadastrada' }, 500);
+  const ig = contas[0].ig_user_id;
+  const lote = Math.min(Number(url.searchParams.get('lote') ?? 20), 60);
+  const o = url.searchParams.get('o') ?? 'posts';
+
+  try {
+    if (o === 'posts')    return json(await sincronizarPosts(ig));
+    if (o === 'metricas') return json(await sincronizarMetricas(lote));
+    if (o === 'palavras') return json(await sincronizarPalavras(lote));
+  } catch (e: any) {
+    return json({ erro: e.message }, 502);
+  }
+  return json({ erro: 'use o=posts, o=metricas ou o=palavras' }, 400);
+}
+
+async function sincronizarPosts(ig: string) {
+  const campos = 'id,permalink,media_type,media_product_type,media_url,thumbnail_url,caption,timestamp';
+  let proxima = `https://graph.facebook.com/v26.0/${ig}/media?fields=${campos}&limit=50&since=${encodeURIComponent(DESDE)}`;
+  let gravadas = 0, paginas = 0;
+
+  while (proxima && paginas < 12) {
+    const r = await metaUrl(proxima);
+    if (!r.ok) throw new Error(r.texto.slice(0, 300));
+    const corpo = JSON.parse(r.texto);
+    const linhas = (corpo.data ?? [])
+      .filter((m: any) => m.timestamp && m.timestamp >= DESDE.slice(0, 10))
+      .map((m: any) => ({
+        media_id: m.id,
+        tipo: m.media_product_type ?? null,
+        formato: m.media_type ?? null,
+        legenda: m.caption ?? null,
+        permalink: m.permalink ?? null,
+        miniatura_url: m.thumbnail_url || m.media_url || null,
+        publicado_em: m.timestamp,
+        atualizado_em: new Date().toISOString(),
+      }));
+    if (linhas.length) {
+      await upsert('publicacoes?on_conflict=media_id', linhas);
+      gravadas += linhas.length;
+    }
+    proxima = corpo.paging?.next ?? '';
+    paginas++;
+  }
+  return { trabalho: 'posts', gravadas, paginas };
+}
+
+// Metricas sao numeros acumulados de agora: cada leitura e uma fotografia
+// datada. A serie historica de um post so nasce a partir da primeira.
+const METRICAS = 'views,reach,likes,comments,saved,shares,total_interactions';
+
+async function sincronizarMetricas(lote: number) {
+  const hoje = new Date().toISOString().slice(0, 10);
+  const jaHoje = await sb(`metricas_publicacao?select=media_id&medido_em=eq.${hoje}&limit=2000`);
+  const feitos = new Set(jaHoje.map((m: any) => m.media_id));
+  const todos = await sb('publicacoes?select=media_id&order=publicado_em.desc&limit=2000');
+  const pendentes = todos.filter((p: any) => !feitos.has(p.media_id)).slice(0, lote);
+
+  const falhas: string[] = [];
+  let medidas = 0;
+  for (const p of pendentes) {
+    const r = await meta('v26.0', `/${p.media_id}/insights?metric=${METRICAS}`);
+    if (!r.ok) { falhas.push(`${p.media_id}: ${r.texto.slice(0, 110)}`); continue; }
+    let dados: any[] = [];
+    try { dados = JSON.parse(r.texto).data ?? []; } catch { /* ignora */ }
+    const v = (n: string) => {
+      const m = dados.find((d) => d.name === n);
+      return m?.values?.[0]?.value ?? m?.total_value?.value ?? null;
+    };
+    await upsert('metricas_publicacao?on_conflict=media_id,medido_em', [{
+      media_id: p.media_id, medido_em: hoje,
+      alcance: v('reach'), visualizacoes: v('views'), curtidas: v('likes'),
+      comentarios: v('comments'), salvamentos: v('saved'),
+      compartilhamentos: v('shares'), interacoes: v('total_interactions'),
+    }]);
+    medidas++;
+  }
+  return { trabalho: 'metricas', medidas,
+    restam: todos.length - feitos.size - medidas, falhas: falhas.slice(0, 5) };
+}
+
+/**
+ * Carga historica da nuvem. Le os comentarios de cada publicacao e guarda
+ * APENAS a contagem por palavra, por dia. Texto e autor nunca sao gravados,
+ * para a carga retroativa respeitar o mesmo aviso de privacidade que o resto
+ * do sistema cumpre.
+ */
+async function sincronizarPalavras(lote: number) {
+  const pendentes = await sb(
+    `publicacoes?select=media_id,publicado_em&comentarios_lidos_em=is.null&order=publicado_em.desc&limit=${lote}`);
+  if (!pendentes.length) return { trabalho: 'palavras', publicacoes: 0, restam: 0 };
+
+  const ignoradas = new Set(
+    (await sb('palavras_ignoradas?select=palavra')).map((p: any) => p.palavra));
+
+  let somadas = 0;
+  for (const p of pendentes) {
+    const contagem = new Map<string, number>();
+    let proxima = `https://graph.facebook.com/v26.0/${p.media_id}/comments?fields=text&limit=100`;
+    let paginas = 0, leu = true;
+
+    while (proxima && paginas < 10) {
+      const r = await metaUrl(proxima);
+      if (!r.ok) { leu = false; break; }
+      const corpo = JSON.parse(r.texto);
+      for (const c of corpo.data ?? []) {
+        for (const bruta of normalizar(c.text ?? '').split(/[^\p{L}\p{N}]+/u)) {
+          if (bruta.length < 3 || ignoradas.has(bruta)) continue;
+          contagem.set(bruta, (contagem.get(bruta) ?? 0) + 1);
+        }
+      }
+      proxima = corpo.paging?.next ?? '';
+      paginas++;
+    }
+    if (!leu) continue;
+
+    const dia = String(p.publicado_em).slice(0, 10);
+    const linhas = [...contagem.entries()].map(([palavra, n]) => ({
+      media_id: p.media_id, palavra, dia, contagem: n,
+    }));
+    for (let i = 0; i < linhas.length; i += 200) {
+      await upsert('palavras?on_conflict=media_id,palavra,dia', linhas.slice(i, i + 200));
+    }
+    await patch(`publicacoes?media_id=eq.${p.media_id}`,
+      { comentarios_lidos_em: new Date().toISOString() });
+    somadas++;
+  }
+
+  const restam = await sb('publicacoes?select=media_id&comentarios_lidos_em=is.null&limit=2000');
+  return { trabalho: 'palavras', publicacoes: somadas, restam: restam.length };
+}
+
+/* ---------------------------------------------------------- link curto */
+
+/**
+ * Quem e robo e decidido pelo gatilho do banco, nao aqui. A lista de agentes
+ * muda com o tempo, e no codigo cada ajuste exigiria republicar a funcao
+ * inteira, que carrega o webhook junto.
+ */
+async function resumo(texto: string) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('cer:' + texto));
+  return [...new Uint8Array(b)].slice(0, 16).map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+async function linkCurto(codigo: string, req: Request) {
+  if (!codigo) return txt('Nao encontrado', 404);
+  const r = await sb(`regras?select=id,link&codigo_curto=eq.${encodeURIComponent(codigo)}&limit=1`);
+  if (!r[0]) return txt('Link nao encontrado', 404);
+
+  const agente = req.headers.get('user-agent') ?? '';
+  const ip = req.headers.get('cf-connecting-ip')
+    ?? (req.headers.get('x-forwarded-for') ?? '').split(',')[0].trim();
+  const hash = await resumo(`${ip}|${agente}`);
+
+  const desde = new Date(Date.now() - JANELA_CLIQUE * 1000).toISOString();
+  const antes = await sb(
+    `cliques?select=id&regra_id=eq.${r[0].id}&origem_hash=eq.${hash}&criado_em=gte.${desde}&limit=1`
+  ).catch(() => []);
+
+  if (!antes.length) {
+    await post('cliques', {
+      regra_id: r[0].id, origem: 'dm',
+      agente: agente.slice(0, 300), origem_hash: hash,
+    });
+  }
+  return Response.redirect(r[0].link, 302);
+}
+
+/* ------------------------------------------------------------ Supabase */
+
+const cab = { 'content-type': 'application/json', apikey: SERVICE_KEY,
+  authorization: `Bearer ${SERVICE_KEY}` };
+
+async function sb(caminho: string) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/${caminho}`, { headers: cab });
+  if (!r.ok) throw new Error(`GET ${caminho}: ${r.status}`);
+  return r.json();
+}
+const post = (tabela: string, dados: unknown) =>
+  fetch(`${SUPABASE_URL}/rest/v1/${tabela}`, { method: 'POST',
+    headers: { ...cab, prefer: 'return=minimal' }, body: JSON.stringify(dados) });
+const patch = (caminho: string, dados: unknown) =>
+  fetch(`${SUPABASE_URL}/rest/v1/${caminho}`, { method: 'PATCH',
+    headers: { ...cab, prefer: 'return=minimal' }, body: JSON.stringify(dados) });
+const upsert = (caminho: string, dados: unknown) =>
+  fetch(`${SUPABASE_URL}/rest/v1/${caminho}`, { method: 'POST',
+    headers: { ...cab, prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify(dados) });
+const guardar = (chave: string, valor: unknown) =>
+  upsert('configuracoes?on_conflict=chave', { chave, valor });
+
+async function inserir(dados: unknown) {
+  const r = await post('disparos', dados);
+  return r.status !== 409 && r.ok;
+}
+
+async function log(corpo: string, valida: boolean, erro: string | null) {
+  let payload: unknown;
+  try { payload = JSON.parse(corpo); } catch { payload = { bruto: corpo.slice(0, 2000) }; }
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/webhook_log`, { method: 'POST',
+      headers: { ...cab, prefer: 'return=representation' },
+      body: JSON.stringify({ payload, assinatura_valida: valida, processado: false, erro }) });
+    if (!r.ok) return null;
+    return (await r.json())[0]?.id ?? null;
+  } catch { return null; }
+}
+
+/* ---------------------------------------------------------------- util */
+
+const txt = (c: string, s = 200) =>
+  new Response(c, { status: s, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+const json = (d: unknown, s = 200) =>
+  new Response(JSON.stringify(d), { status: s, headers: { 'content-type': 'application/json; charset=utf-8' } });
+const html = (c: string) =>
+  new Response(c, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+
+/* --------------------------------------------------------------- painel */
+
+let logoCache: string | null = null;
+async function pegarLogo() {
+  if (logoCache) return logoCache;
+  try {
+    const r = await sb('configuracoes?select=valor&chave=eq.logo_marca&limit=1');
+    const v = String(r[0]?.valor ?? '');
+    if (v) logoCache = v;
+    return v;
+  } catch { return ''; }
+}
+async function pagina() {
+  return PAGINA.replaceAll('__LOGO__', await pegarLogo());
+}
+
+const PAGINA = `<!doctype html>
+<html lang="pt-BR" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Comenta e Recebe</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --mag:#282726; --mag-ink:#f2ede3; --mag-soft:#e4dccc; --rosa:#cfa963; --acc:#b1a18c; --acc-tx:#6b5e4b;
+  --bg:#f2ede3; --sup:#fbf9f4; --sup2:#f6f2ea;
+  --tx:#282726; --tx2:#5c564c; --tx3:#6f685c;
+  --ln:#d6d0c2; --ln2:#e5dfd2;
+  --late:#9a4a33; --late-soft:#f3e0d7; --ok:#3d5742; --ok-soft:#e1e8df;
+  --rev:#2c4a51; --rev-soft:#dde9eb; --and:#5e4a18; --and-soft:#f1e6cf; --col:#e6dfd1;
+  --shadow:0 10px 30px rgba(40,39,38,.14);
+  --lateral:232px; --leitura:1120px; --inverte:0;
+}
+:root[data-theme="dark"]{
+  --mag:#f2ede3; --mag-ink:#282726; --mag-soft:#3a3732; --acc-tx:#cbbca6;
+  --bg:#1e1d1c; --sup:#2a2927; --sup2:#242322;
+  --tx:#f2ede3; --tx2:#d6d0c2; --tx3:#a39a8b;
+  --ln:#45433f; --ln2:#33312e;
+  --late:#e39a7f; --late-soft:#3d2a23; --ok:#a2b59f; --ok-soft:#27302a;
+  --rev:#abc8cd; --rev-soft:#243133; --and:#e0c084; --and-soft:#3a3122; --col:#2f2e2b;
+  --shadow:0 10px 30px rgba(0,0,0,.5); --inverte:1;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--tx);
+  font:400 15px/1.45 Manrope,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+h1,h2,h3{margin:0;font-weight:600;letter-spacing:-.01em}
+h1{font-size:clamp(19px,2.2vw,22px)} h2{font-size:17px} h3{font-size:15px}
+img{max-width:100%}
+:focus-visible{outline:2px solid var(--mag);outline-offset:2px;border-radius:3px}
+
+img.logo{display:block;height:auto;filter:invert(var(--inverte))}
+.marca{display:block;padding-bottom:20px;border-bottom:1px solid var(--ln2)}
+.marca img.logo{width:132px}
+.marca .apoio{font-size:12.5px;color:var(--tx3);margin-top:12px}
+
+.btn{font:inherit;cursor:pointer;padding:10px 15px;border-radius:6px;min-height:44px;
+  border:1px solid var(--ln);background:var(--sup);color:var(--tx);
+  transition:border-color .12s,background .12s}
+.btn:hover{border-color:var(--acc)}
+.btn.pri{background:var(--mag);color:var(--mag-ink);border-color:var(--mag)}
+.btn.ghost{background:none;border-color:transparent;color:var(--tx2)}
+.btn.ghost:hover{color:var(--tx);background:var(--sup2)}
+.btn.sm{padding:7px 12px;font-size:13px;min-height:40px}
+.btn.armado{background:var(--late);border-color:var(--late);color:#fff}
+.btn:disabled{opacity:.55;cursor:default}
+
+input,textarea,select{font:inherit;width:100%;padding:11px 13px;border:1px solid var(--ln);
+  border-radius:6px;background:var(--sup);color:var(--tx)}
+textarea{resize:vertical}
+
+.entrada{display:grid;grid-template-columns:1fr 1fr;min-height:100vh;min-height:100dvh}
+.vitrine{position:relative;overflow:hidden;background:var(--col);
+  display:grid;place-items:center;padding:clamp(24px,5vw,56px)}
+.vitrine svg.fundo{position:absolute;inset:0;width:100%;height:100%}
+.vitrine .dentro{position:relative;z-index:1;width:100%;max-width:400px;text-align:center}
+.vitrine img.logo{width:min(300px,80%);margin:0 auto clamp(20px,3vw,28px)}
+.vitrine .conselho{font-size:clamp(14px,1.5vw,16px);line-height:1.5;color:var(--tx2);
+  max-width:30ch;margin:0 auto}
+.vitrine .produto{margin-top:clamp(24px,4vw,36px);padding-top:clamp(20px,3vw,26px);
+  border-top:1px solid var(--ln)}
+.vitrine .produto h1{font-size:clamp(20px,2.4vw,26px)}
+.vitrine .produto p{color:var(--tx3);margin:7px 0 0;font-size:14px}
+.formulario{display:grid;place-items:center;padding:clamp(24px,5vw,56px)}
+.caixa{width:100%;max-width:340px}
+.caixa h2{font-size:clamp(21px,2.4vw,26px)}
+.rotulo{display:block;font-size:13px;color:var(--tx2);margin:18px 0 6px}
+.senha{position:relative}
+.senha input{padding-right:84px}
+.senha button{position:absolute;right:6px;top:50%;transform:translateY(-50%);
+  background:none;border:0;color:var(--tx2);font:inherit;font-size:13px;cursor:pointer;padding:6px 8px}
+.elo{display:block;text-align:center;margin-top:14px;color:var(--acc-tx);
+  font-size:14px;background:none;border:0;width:100%;cursor:pointer;font-family:inherit}
+.primeiro{border-top:1px solid var(--ln);margin-top:24px;padding-top:18px;
+  font-size:13px;color:var(--tx3);line-height:1.5}
+.primeiro b{color:var(--tx2)}
+
+.layout{display:flex;min-height:100vh;min-height:100dvh}
+aside{width:var(--lateral);flex:none;background:var(--sup2);
+  border-right:1px solid var(--ln);display:flex;flex-direction:column;padding:22px 14px}
+nav{margin-top:20px;display:flex;flex-direction:column;gap:2px}
+nav a{display:flex;align-items:center;gap:8px;padding:10px 11px;border-radius:6px;
+  color:var(--tx2);cursor:pointer;font-size:14px;white-space:nowrap;transition:background .12s,color .12s}
+nav a:hover{background:var(--sup);color:var(--tx)}
+nav a[aria-current=page]{background:var(--mag-soft);color:var(--tx);font-weight:700}
+nav .pilula{margin-left:auto;background:var(--mag);color:var(--mag-ink);
+  font-size:11px;padding:1px 7px;border-radius:20px;font-variant-numeric:tabular-nums}
+.rodape{margin-top:auto;padding-top:16px;font-size:12.5px;display:flex;flex-direction:column;gap:10px}
+.rodape a{color:var(--tx3);cursor:pointer}
+.rodape a:hover{color:var(--tx)}
+.euzinho{display:flex;align-items:center;gap:10px;padding-top:14px;border-top:1px solid var(--ln2)}
+.inicial{width:34px;height:34px;flex:none;border-radius:50%;background:var(--mag-soft);
+  display:grid;place-items:center;font-size:12.5px;font-weight:700;color:var(--tx)}
+
+.palco{flex:1;min-width:0;display:flex;justify-content:center}
+main{width:100%;max-width:var(--leitura);padding:clamp(18px,3vw,30px) clamp(16px,3vw,30px) 96px}
+.topo{display:flex;align-items:flex-start;gap:14px;margin-bottom:22px;flex-wrap:wrap}
+.topo .cresce{flex:1;min-width:230px}
+.topo p{margin:6px 0 0;font-size:14px;color:var(--tx2)}
+
+.cartao{background:var(--sup);border:1px solid var(--ln);border-radius:6px;padding:clamp(16px,2vw,22px)}
+.lista{background:var(--sup);border:1px solid var(--ln);border-radius:6px}
+.linha{display:flex;gap:16px;align-items:center;padding:16px 18px;border-top:1px solid var(--ln2);flex-wrap:wrap}
+.linha:first-child{border-top:0}
+.cresce{flex:1;min-width:220px}
+.sub{font-size:13px;color:var(--tx2);margin-top:4px}
+
+.capa{width:56px;height:56px;flex:none;border-radius:5px;object-fit:cover;
+  background:var(--sup2);border:1px solid var(--ln)}
+.capa.vazia{display:grid;place-items:center;color:var(--tx2);font-size:11px;text-align:center;line-height:1.2}
+.capinha{width:38px;height:38px;border-radius:4px;object-fit:cover;flex:none;border:1px solid var(--ln)}
+
+.placar{display:flex;gap:20px;flex-wrap:wrap;margin-top:10px}
+.placar div{font-size:12px;color:var(--tx3)}
+.placar b{display:block;font-size:16px;font-weight:600;color:var(--tx);font-variant-numeric:tabular-nums}
+.placar b.mudo{color:var(--tx3)}
+.placar b.ruim{color:var(--late)}
+
+.chip{display:inline-block;font-size:12px;padding:3px 10px;border-radius:20px;
+  border:1px solid var(--ln);color:var(--tx2);background:var(--sup2);white-space:nowrap}
+.chip.ok{color:var(--ok);background:var(--ok-soft);border-color:transparent}
+.chip.and{color:var(--and);background:var(--and-soft);border-color:transparent}
+.chip.late{color:var(--late);background:var(--late-soft);border-color:transparent}
+.chip.rev{color:var(--rev);background:var(--rev-soft);border-color:transparent}
+.chipsel{cursor:pointer;font:inherit;font-size:13px;padding:9px 14px;border-radius:20px;min-height:44px;
+  border:1px solid var(--ln);background:var(--sup);color:var(--tx2)}
+.chipsel[aria-pressed=true]{border-color:var(--mag);background:var(--mag-soft);color:var(--tx);font-weight:600}
+.chipsel.mini{min-height:40px;padding:8px 13px;font-size:12.5px}
+.chipsel.mini[aria-pressed=true]::before{content:"\\2713\\00a0";font-weight:700}
+
+.pastas{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center}
+.barra{background:var(--sup);border:1px solid var(--ln);border-radius:6px;
+  padding:12px 14px;margin-bottom:12px}
+.barra h3{font-size:12.5px;color:var(--tx2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px}
+.barra .pastas{margin:0}
+
+.tarja{display:flex;align-items:center;gap:12px;background:var(--and-soft);color:var(--and);
+  border:1px solid var(--and);border-radius:6px;padding:11px 15px;margin-bottom:18px;
+  font-size:13.5px;flex-wrap:wrap}
+.tarja .btn{margin-left:auto;background:transparent;border-color:var(--and);color:var(--and)}
+
+.rolavel{overflow-x:auto;-webkit-overflow-scrolling:touch}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;font-weight:500;color:var(--tx2);padding:11px 14px;
+  border-bottom:1px solid var(--ln);white-space:nowrap}
+th.ordenavel{cursor:pointer;user-select:none}
+th.ordenavel:hover{color:var(--tx)}
+th[aria-sort]{color:var(--tx);font-weight:700}
+th .marcaajuda{border-bottom:1px dotted var(--acc);cursor:help}
+td{padding:11px 14px;border-bottom:1px solid var(--ln2);white-space:nowrap}
+td.titulo{white-space:normal;min-width:260px}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+
+.glossario{margin-top:14px}
+.glossario summary{cursor:pointer;font-size:13.5px;color:var(--acc-tx);padding:6px 0}
+.glossario dl{margin:10px 0 0;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px 22px}
+.glossario dt{font-weight:600;font-size:13.5px}
+.glossario dd{margin:3px 0 0;font-size:13px;color:var(--tx2);line-height:1.45}
+
+.numeros{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:1px;
+  background:var(--ln);border:1px solid var(--ln);border-radius:6px;overflow:hidden;margin-bottom:12px}
+.numero{background:var(--sup);padding:16px 18px}
+.numero b{display:block;font-size:25px;font-weight:600;
+  letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.numero b.grande{font-size:clamp(30px,4vw,42px)}
+.numero span{font-size:12.5px;color:var(--tx2)}
+.numero em{display:block;font-style:normal;font-size:13px;color:var(--ok);font-weight:600;margin-top:2px}
+
+.campo{display:flex;gap:16px;align-items:flex-start;margin-bottom:16px}
+.campo>label{width:130px;flex:none;font-size:13.5px;font-weight:600;color:var(--tx2);padding-top:11px}
+.campo>div{flex:1;min-width:0}
+.dica{display:block;font-size:12.5px;color:var(--tx3);margin-top:6px}
+.contador{float:right;font-variant-numeric:tabular-nums}
+.contador.cheio{color:var(--late);font-weight:700}
+
+.posts{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px;
+  max-height:330px;overflow-y:auto;padding:2px}
+.post{border:1px solid var(--ln);border-radius:6px;overflow:hidden;background:var(--sup2);
+  padding:0;cursor:pointer;display:block}
+.post img{width:100%;aspect-ratio:1;object-fit:cover;display:block}
+.post[aria-pressed=true]{outline:2px solid var(--mag);border-color:var(--mag)}
+.post small{display:block;padding:6px 7px;font-size:11px;color:var(--tx2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.balao{background:var(--sup2);border:1px solid var(--ln2);border-radius:14px 14px 14px 4px;
+  padding:11px 14px;font-size:14px;max-width:330px;white-space:pre-wrap;word-break:break-word}
+.balao.pub{border-radius:14px;background:var(--sup);max-width:none}
+.botaodm{display:block;margin:11px -14px -11px;border-top:1px solid var(--ln);
+  padding:11px;text-align:center;font-weight:600;color:var(--rev)}
+
+.passos{list-style:none;display:flex;margin:0 0 26px;padding:0;align-items:center;max-width:620px}
+.passos li{display:flex;align-items:center;gap:9px;font-size:14px;color:var(--tx2)}
+.passos li.aqui{font-weight:700;color:var(--tx)}
+.passos .risco{flex:1;height:1px;background:var(--ln);margin:0 12px}
+.bolha{width:28px;height:28px;border-radius:50%;border:1px solid var(--ln);
+  display:grid;place-items:center;font-size:13px;flex:none}
+.passos li.aqui .bolha{background:var(--mag);color:var(--mag-ink);border-color:var(--mag);font-weight:700}
+.passos li.feito .bolha{background:var(--ok);color:#fff;border-color:var(--ok)}
+.passos li.feito{color:var(--ok);font-weight:600}
+
+.frase{background:var(--sup);border:1px solid var(--ln);border-radius:6px;
+  padding:26px 28px;font-size:19px;line-height:1.65;margin-bottom:22px}
+.frase mark{background:var(--mag-soft);color:var(--tx);font-weight:700;padding:2px 8px;border-radius:4px}
+
+.nuvem{width:100%}
+.nuvem svg{display:block;width:100%;height:auto;overflow:visible}
+.nuvem text{font-family:Manrope,system-ui,sans-serif;cursor:default}
+
+.vazio{border:1px dashed var(--ln);border-radius:6px;padding:38px 20px;text-align:center;background:var(--sup2)}
+.vazio b{display:block;margin-bottom:5px}
+.vazio span{color:var(--tx2);font-size:14px}
+
+.fab{position:fixed;right:clamp(16px,3vw,26px);bottom:clamp(16px,3vw,26px);
+  width:58px;height:58px;border-radius:50%;background:var(--mag);color:var(--mag-ink);
+  border:0;font-size:27px;line-height:1;cursor:pointer;box-shadow:var(--shadow);z-index:50}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:clamp(16px,3vw,26px);z-index:60;
+  background:var(--mag);color:var(--mag-ink);padding:12px 18px;border-radius:8px;
+  box-shadow:var(--shadow);display:flex;align-items:center;gap:16px;font-size:14px;
+  max-width:calc(100vw - 32px)}
+.toast button{background:none;border:0;color:var(--rosa);font:inherit;font-weight:700;cursor:pointer}
+.menu{position:fixed;z-index:70;min-width:186px;padding:5px;border-radius:8px;
+  background:color-mix(in srgb,var(--sup) 92%,transparent);backdrop-filter:blur(14px);
+  border:1px solid var(--ln);box-shadow:var(--shadow);font-size:14px}
+.menu button{display:flex;align-items:center;width:100%;height:34px;padding:0 10px;border:0;
+  background:none;color:var(--tx);font:inherit;text-align:left;border-radius:5px;cursor:pointer}
+.menu button:hover{background:var(--mag-soft)}
+.menu button.perigo{color:var(--late)}
+.menu hr{border:0;border-top:1px solid var(--ln2);margin:4px 6px}
+.aviso{padding:12px 15px;border-radius:6px;font-size:14px;margin:14px 0;line-height:1.45;
+  background:var(--late-soft);color:var(--late)}
+.aviso.ok{background:var(--ok-soft);color:var(--ok)}
+.aviso.atencao{background:var(--and-soft);color:var(--and)}
+.aviso.info{background:var(--rev-soft);color:var(--rev)}
+.aviso small{display:block;margin-top:6px;opacity:.85;word-break:break-word}
+.chaveprov{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:19px;letter-spacing:.06em;
+  background:var(--sup);border:1px solid var(--ok);border-radius:6px;padding:13px 18px;color:var(--ok)}
+
+@media (max-width:820px){
+  .entrada{grid-template-columns:1fr;min-height:0}
+  .vitrine{padding:34px 24px;order:-1}
+  .vitrine img.logo{width:min(240px,66%)}
+  .formulario{padding:28px 24px 48px}
+  .layout{flex-direction:column}
+  aside{width:auto;border-right:0;border-bottom:1px solid var(--ln);
+    padding:12px 14px 0;flex-direction:row;align-items:center;gap:14px;flex-wrap:wrap}
+  .marca{padding:0;border:0}
+  .marca img.logo{width:112px}
+  .marca .apoio{display:none}
+  nav{margin:0 0 0 auto;flex-direction:row;gap:4px;order:3;width:100%;
+    overflow-x:auto;padding-bottom:10px;scrollbar-width:none}
+  nav::-webkit-scrollbar{display:none}
+  .rodape{margin:0 0 0 auto;padding:0;flex-direction:row;align-items:center}
+  .euzinho{border-top:0;padding-top:0}
+  .campo{flex-direction:column;gap:7px}
+  .campo>label{width:auto;padding-top:0}
+  .balao{max-width:none}
+  .passos{flex-wrap:wrap;gap:10px}
+  .passos .risco{display:none}
+  .frase{font-size:17px;padding:20px}
+}
+@media (min-width:1600px){ :root{ --leitura:1280px } }
+</style>
+</head>
+<body><div id="app"></div>
+
+<script type="module">
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
+const sb = createClient('${SUPABASE_URL}', '${CHAVE_PUBLICA}');
+const app = document.getElementById('app');
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const normalizar = (s) => (s||'').toLowerCase().normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').replace(/\\s+/g,' ').trim();
+const num = (n) => Number(n ?? 0).toLocaleString('pt-BR');
+const bytes = (s) => new TextEncoder().encode(s ?? '').length;
+const LOGO = 'data:image/png;base64,__LOGO__';
+const marcaImg = (estilo) =>
+  \`<img class="logo" src="\${LOGO}" alt="CAU/RS" \${estilo ? 'style="'+estilo+'"' : ''}>\`;
+const LIMITE_DM = 1000;
+let sessao=null, perfil=null, aba='automacoes', modoTeste=true, contagem=0, pastaAtual='todas', situacao='todas';
+const souAdmin = () => perfil?.papel === 'administrador';
+
+document.documentElement.dataset.theme = localStorage.getItem('tema') || 'light';
+
+async function api(rota, opcoes){
+  const r = await fetch(rota, { ...opcoes, headers: {
+    'content-type':'application/json',
+    authorization: 'Bearer ' + sessao.access_token, ...(opcoes?.headers ?? {}) } });
+  const corpo = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(corpo.erro || 'erro inesperado');
+  return corpo;
+}
+
+function toast(texto, acao, aoDesfazer){
+  document.querySelector('.toast')?.remove();
+  const d = document.createElement('div');
+  d.className = 'toast';
+  d.innerHTML = \`<span>\${esc(texto)}</span>\` + (acao ? \`<button>\${esc(acao)}</button>\` : '');
+  if (acao) d.querySelector('button').onclick = () => { d.remove(); aoDesfazer(); };
+  document.body.appendChild(d);
+  setTimeout(() => d.remove(), 7000);
+}
+
+function menuContexto(ev, itens){
+  ev.preventDefault();
+  document.querySelector('.menu')?.remove();
+  const m = document.createElement('div');
+  m.className = 'menu';
+  m.innerHTML = itens.map((i) => i === '-' ? '<hr>' : \`<button class="\${i.perigo?'perigo':''}">\${esc(i.texto)}</button>\`).join('');
+  document.body.appendChild(m);
+  m.style.left = Math.min(ev.clientX, innerWidth - m.offsetWidth - 10) + 'px';
+  m.style.top = Math.min(ev.clientY, innerHeight - m.offsetHeight - 10) + 'px';
+  [...m.querySelectorAll('button')].forEach((b, i) => {
+    const item = itens.filter((x) => x !== '-')[i];
+    b.onclick = () => { m.remove(); item.acao(); };
+  });
+  setTimeout(() => addEventListener('click', () => m.remove(), { once:true }));
+}
+
+const iniciais = (nome) => {
+  const p = (nome || '?').trim().split(/\\s+/);
+  return ((p[0]?.[0] ?? '') + (p.length > 1 ? p[p.length-1][0] : '')).toUpperCase();
+};
+
+const quando = (iso) => {
+  if (!iso) return 'nunca entrou';
+  const d = new Date(iso);
+  const min = Math.round((new Date() - d) / 60000);
+  if (min < 2) return 'agora mesmo';
+  if (min < 60) return \`h\\u00e1 \${min} minutos\`;
+  if (min < 1440) return \`h\\u00e1 \${Math.round(min/60)} horas\`;
+  return d.toLocaleDateString('pt-BR', { day:'2-digit', month:'short' }) + ', '
+       + d.toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit' });
+};
+
+// Mesma regra do servidor: no modo botao o [link] sai e so espaco horizontal
+// e colapsado, para a quebra de linha sobreviver.
+const textoDaMensagem = (bruto, rotulo, link) => rotulo
+  ? (bruto ?? '').replace(/\\[link\\]/gi, '').replace(/[ \\t]{2,}/g, ' ')
+      .split('\\n').map((l) => l.replace(/[ \\t]+$/, '')).join('\\n').trim()
+  : (bruto ?? '').replace(/\\[link\\]/gi, link);
+
+async function iniciar(){
+  const { data } = await sb.auth.getSession();
+  sessao = data.session;
+  if (!sessao) return telaEntrar();
+  const [{ data: c }, { data: p }, { count }] = await Promise.all([
+    sb.from('configuracoes').select('valor').eq('chave','modo_teste').maybeSingle(),
+    sb.from('perfis').select('nome,email,papel,trocar_senha').eq('id', sessao.user.id).maybeSingle(),
+    sb.from('regras').select('id', { count:'exact', head:true }).eq('ativa', true),
+  ]);
+  modoTeste = c?.valor === true;
+  perfil = p;
+  contagem = count ?? 0;
+  if (perfil?.trocar_senha) return telaTrocarSenha();
+  desenhar();
+}
+
+function telaTrocarSenha(aviso){
+  app.innerHTML = \`<div class="formulario" style="min-height:100vh"><div class="caixa">
+    \${marcaImg('width:190px;margin-bottom:28px')}
+    <h2>Crie sua senha</h2>
+    <p class="sub">Voc\\u00ea entrou com uma senha provis\\u00f3ria. Escolha uma sua para continuar.</p>
+    \${aviso ? \`<div class="aviso">\${esc(aviso)}</div>\` : ''}
+    <label class="rotulo" for="n1">Nova senha</label>
+    <input id="n1" type="password" autocomplete="new-password">
+    <label class="rotulo" for="n2">Repita</label>
+    <input id="n2" type="password" autocomplete="new-password">
+    <button class="btn pri" id="ok" style="width:100%;margin-top:20px">Salvar e entrar</button>
+    <p class="primeiro">No m\\u00ednimo 8 caracteres. Depois disso a senha provis\\u00f3ria deixa de valer.</p>
+  </div></div>\`;
+  document.getElementById('ok').onclick = async () => {
+    const a = document.getElementById('n1').value, b = document.getElementById('n2').value;
+    if (a.length < 8) return telaTrocarSenha('A senha precisa de pelo menos 8 caracteres.');
+    if (a !== b) return telaTrocarSenha('As duas senhas n\\u00e3o conferem.');
+    const { error } = await sb.auth.updateUser({ password: a });
+    if (error) return telaTrocarSenha(error.message);
+    await sb.from('perfis').update({ trocar_senha:false }).eq('id', sessao.user.id);
+    perfil.trocar_senha = false;
+    desenhar(); toast('Senha criada. Bem-vindo!');
+  };
+}
+
+// O painel da marca fica a direita; o formulario, a esquerda.
+function telaEntrar(msg, tipo){
+  app.innerHTML = \`<div class="entrada">
+    <div class="formulario"><div class="caixa">
+      <h2>Boas-vindas</h2>
+      <p class="sub">Entre com seu e-mail e senha para gerenciar as respostas do perfil.</p>
+      \${msg ? \`<div class="aviso \${tipo==='ok'?'ok':''}" role="status">\${esc(msg)}</div>\` : ''}
+      <label class="rotulo" for="e">E-mail</label>
+      <input id="e" type="email" autocomplete="username" inputmode="email">
+      <label class="rotulo" for="s">Senha</label>
+      <div class="senha"><input id="s" type="password" autocomplete="current-password">
+        <button type="button" id="ver">Mostrar</button></div>
+      <button class="btn pri" id="b" style="width:100%;margin-top:20px">Entrar</button>
+      <button class="elo" id="esqueci">Esqueci minha senha</button>
+      <p class="primeiro"><b>Primeiro acesso?</b> Use a senha provis\\u00f3ria que a coordena\\u00e7\\u00e3o de Comunica\\u00e7\\u00e3o entregou. O sistema pede uma senha sua logo na entrada.</p>
+    </div></div>
+    <div class="vitrine">
+      <svg class="fundo" viewBox="0 0 600 800" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+        <path d="M300 -100 L620 -100 L300 900 L-20 900 Z" fill="var(--bg)" opacity=".7"/>
+        <path d="M120 900 Q 320 480 300 -100 L600 -100 L600 900 Z" fill="var(--sup2)" opacity=".5"/>
+      </svg>
+      <div class="dentro">
+        \${marcaImg()}
+        <p class="conselho">Conselho de Arquitetura e Urbanismo do Rio Grande do Sul</p>
+        <div class="produto"><h1>Comenta e Recebe</h1>
+          <p>Respostas autom\\u00e1ticas no Instagram, em um s\\u00f3 lugar.</p></div>
+      </div>
+    </div></div>\`;
+
+  const ver = document.getElementById('ver');
+  ver.onclick = () => {
+    const campo = document.getElementById('s');
+    const escondido = campo.type === 'password';
+    campo.type = escondido ? 'text' : 'password';
+    ver.textContent = escondido ? 'Ocultar' : 'Mostrar';
+  };
+  const botao = document.getElementById('b');
+  const entrar = async () => {
+    botao.disabled = true; botao.textContent = 'Entrando\\u2026';
+    const { error } = await sb.auth.signInWithPassword({
+      email: document.getElementById('e').value.trim(),
+      password: document.getElementById('s').value });
+    if (error) return telaEntrar('E-mail ou senha n\\u00e3o conferem. Confira os dados ou use a op\\u00e7\\u00e3o Esqueci minha senha.');
+    iniciar();
+  };
+  botao.onclick = entrar;
+  document.getElementById('s').onkeydown = (ev) => { if (ev.key === 'Enter') entrar(); };
+  document.getElementById('e').onkeydown = (ev) => { if (ev.key === 'Enter') document.getElementById('s').focus(); };
+  document.getElementById('esqueci').onclick = async () => {
+    const email = document.getElementById('e').value.trim();
+    if (!email) return telaEntrar('Escreva seu e-mail antes de pedir a troca de senha.');
+    await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname });
+    telaEntrar('Se o e-mail estiver cadastrado, voc\\u00ea vai receber um link para criar uma nova senha.', 'ok');
+  };
+}
+
+const ABAS = { automacoes:'Automa\\u00e7\\u00f5es', desempenho:'Desempenho', usuarios:'Usu\\u00e1rios', ajustes:'Ajustes' };
+
+function desenhar(){
+  app.innerHTML = \`<div class="layout">
+    <aside>
+      <div class="marca">\${marcaImg()}
+        <div class="apoio">Comenta e Recebe</div></div>
+      <nav>\${Object.entries(ABAS).map(([k,v]) => \`<a data-aba="\${k}" \${k===aba?'aria-current="page"':''}>\${v}
+        \${k==='automacoes'&&contagem?\`<span class="pilula">\${contagem}</span>\`:''}</a>\`).join('')}</nav>
+      <div class="rodape">
+        <div class="euzinho"><span class="inicial" aria-hidden="true">\${esc(iniciais(perfil?.nome))}</span>
+          <span style="min-width:0">
+            <span style="display:block;font-size:13px;color:var(--tx2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${esc(perfil?.nome ?? '')}</span>
+            <span style="display:block;font-size:12px;color:var(--tx3)">\${souAdmin() ? 'Administrador' : 'Editor'}</span>
+          </span></div>
+        <a id="sair">Sair</a>
+      </div>
+    </aside>
+    <div class="palco"><main id="conteudo"></main></div></div>
+    \${aba==='automacoes'?'<button class="fab" id="fab" title="Nova automa\\u00e7\\u00e3o" aria-label="Nova automa\\u00e7\\u00e3o">+</button>':''}\`;
+
+  app.querySelectorAll('nav a').forEach((a) => { a.onclick = () => { aba = a.dataset.aba; desenhar(); }; });
+  document.getElementById('sair').onclick = async () => { await sb.auth.signOut(); location.reload(); };
+  const fab = document.getElementById('fab');
+  if (fab) fab.onclick = () => assistente();
+  ({ automacoes: abaAutomacoes, desempenho: abaDesempenho, usuarios: abaUsuarios, ajustes: abaAjustes })[aba]();
+}
+
+function tarja(){
+  return modoTeste ? \`<div class="tarja"><span>Modo de teste ligado. S\\u00f3 as contas testadoras recebem mensagem.</span>
+    \${souAdmin() ? '<button class="btn sm" id="desligar">Desligar</button>' : ''}</div>\` : '';
+}
+function ligarTarja(){
+  const b = document.getElementById('desligar');
+  if (b) b.onclick = async () => {
+    await sb.from('configuracoes').update({ valor:false }).eq('chave','modo_teste');
+    modoTeste = false; desenhar();
+    toast('Modo de teste desligado', 'Desfazer', async () => {
+      await sb.from('configuracoes').update({ valor:true }).eq('chave','modo_teste');
+      modoTeste = true; desenhar();
+    });
+  };
+}
+
+/* --------------------------------------------------------- automacoes */
+
+let resultados = {};
+
+async function abaAutomacoes(){
+  const c = document.getElementById('conteudo');
+  c.innerHTML = tarja() + '<p class="sub">Carregando automa\\u00e7\\u00f5es\\u2026</p>';
+  ligarTarja();
+
+  const [{ data: itens, error }, { data: pastas }, { data: medidas }] = await Promise.all([
+    sb.from('regras').select('*, pastas(nome)').order('criado_em', { ascending:false }),
+    sb.from('pastas').select('*').order('criado_em'),
+    sb.from('desempenho_por_regra').select('*'),
+  ]);
+  if (error) { c.innerHTML = tarja() + \`<div class="aviso">N\\u00e3o foi poss\\u00edvel carregar: \${esc(error.message)}</div>\`; return ligarTarja(); }
+
+  resultados = Object.fromEntries((medidas ?? []).map((m) => [m.regra_id, m]));
+  const soma = (k) => (medidas ?? []).reduce((t,l) => t + Number(l[k] ?? 0), 0);
+
+  const visiveis = itens.filter((r) =>
+    (pastaAtual === 'todas' || (pastaAtual === 'soltas' ? !r.pasta_id : r.pasta_id === pastaAtual)) &&
+    (situacao === 'todas' || (situacao === 'ativas' ? r.ativa : !r.ativa)));
+
+  c.innerHTML = tarja() + \`<div class="topo">
+      <div class="cresce"><h1>Automa\\u00e7\\u00f5es</h1>
+        <p>Respostas autom\\u00e1ticas a quem comenta no Instagram.</p></div>
+      <button class="btn" id="npasta">Nova pasta</button>
+      <button class="btn pri" id="nova">Criar automa\\u00e7\\u00e3o</button></div>
+    <div class="numeros">
+      <div class="numero"><b>\${itens.filter((r)=>r.ativa).length}</b><span>automa\\u00e7\\u00f5es ativas</span></div>
+      <div class="numero"><b>\${num(soma('comentarios'))}</b><span>coment\\u00e1rios recebidos</span></div>
+      <div class="numero"><b>\${num(soma('dms_enviadas'))}</b><span>conversas iniciadas</span></div>
+      <div class="numero"><b>\${num(soma('cliques'))}</b><span>cliques no link</span></div>
+    </div>
+    <p class="sub" style="margin:0 0 20px">Desde o in\\u00edcio. O recorte por per\\u00edodo fica em Desempenho.</p>
+    <div id="form"></div>
+    \${(pastas ?? []).length ? \`<div class="pastas">
+      <button class="chipsel mini" data-pasta="todas" aria-pressed="\${pastaAtual==='todas'}">Todas as pastas</button>
+      \${pastas.map((p) => \`<button class="chipsel mini" data-pasta="\${p.id}" aria-pressed="\${pastaAtual===p.id}">\${esc(p.nome)}
+        \${itens.filter((r)=>r.pasta_id===p.id).length}</button>\`).join('')}
+      <button class="chipsel mini" data-pasta="soltas" aria-pressed="\${pastaAtual==='soltas'}">Sem pasta</button>
+    </div>\` : ''}
+    <div class="pastas">
+      <button class="chipsel mini" data-sit="todas" aria-pressed="\${situacao==='todas'}">Todas</button>
+      <button class="chipsel mini" data-sit="ativas" aria-pressed="\${situacao==='ativas'}">Ativas</button>
+      <button class="chipsel mini" data-sit="pausadas" aria-pressed="\${situacao==='pausadas'}">Pausadas</button>
+    </div>
+    \${visiveis.length ? \`<div class="lista">\${visiveis.map(linhaAutomacao).join('')}</div>\`
+      : (itens.length ? '<div class="vazio"><b>Nada neste filtro</b><span>Troque a pasta ou a situa\\u00e7\\u00e3o acima.</span></div>'
+        : '<div class="vazio"><b>Nenhuma automa\\u00e7\\u00e3o ainda</b><span>Crie a primeira para come\\u00e7ar a responder coment\\u00e1rios.</span></div>')}\`;
+  ligarTarja();
+
+  document.getElementById('nova').onclick = () => assistente();
+  document.getElementById('npasta').onclick = async () => {
+    const nome = prompt('Nome da pasta');
+    if (!nome?.trim()) return;
+    await sb.from('pastas').insert({ nome: nome.trim() });
+    abaAutomacoes(); toast('Pasta criada');
+  };
+  c.querySelectorAll('[data-pasta]').forEach((b) => { b.onclick = () => { pastaAtual = b.dataset.pasta; abaAutomacoes(); }; });
+  c.querySelectorAll('[data-sit]').forEach((b) => { b.onclick = () => { situacao = b.dataset.sit; abaAutomacoes(); }; });
+
+  c.querySelectorAll('[data-id]').forEach((el) => {
+    const r = itens.find((x) => x.id === el.dataset.id);
+    el.oncontextmenu = (ev) => menuContexto(ev, [
+      { texto:'Editar', acao:() => assistente(r) },
+      { texto: r.ativa ? 'Pausar' : 'Ativar', acao:() => alternar(r) },
+      { texto:'Duplicar', acao:() => duplicar(r) },
+      '-', { texto:'Excluir', perigo:true, acao:() => excluir(r) },
+    ]);
+    el.querySelector('[data-editar]').onclick = () => assistente(r);
+    el.querySelector('[data-alternar]').onclick = () => alternar(r);
+    const bx = el.querySelector('[data-excluir]');
+    if (!bx) return;
+    let armado = false;
+    bx.onclick = () => {
+      if (!armado) { armado = true; bx.classList.add('armado'); bx.textContent = 'Confirmar';
+        setTimeout(() => { armado = false; bx.classList.remove('armado'); bx.textContent = 'Excluir'; }, 4000); return; }
+      excluir(r);
+    };
+  });
+}
+
+function alcance(r){
+  if (r.alvo === 'qualquer') return 'Qualquer publica\\u00e7\\u00e3o';
+  if (r.alvo === 'proxima' && !r.media_id) return 'Aguardando a pr\\u00f3xima publica\\u00e7\\u00e3o';
+  return \`<a href="\${esc(r.permalink||'#')}" target="_blank" rel="noopener" style="color:var(--acc-tx)">Publica\\u00e7\\u00e3o espec\\u00edfica</a>\`;
+}
+
+function capa(r){
+  if (r.miniatura_url) return \`<img class="capa" src="\${esc(r.miniatura_url)}" alt="" loading="lazy">\`;
+  if (r.alvo === 'qualquer') return '<div class="capa vazia">todas</div>';
+  if (r.alvo === 'proxima') return '<div class="capa vazia">pr\\u00f3xima</div>';
+  return '<div class="capa vazia">post</div>';
+}
+
+function linhaAutomacao(r){
+  const esperando = r.alvo === 'proxima' && !r.media_id;
+  const m = resultados[r.id] ?? {};
+  const temBotao = (r.rotulo_botao ?? '').trim();
+  const formato = temBotao ? \`bot\\u00e3o \\u201c\${esc(r.rotulo_botao)}\\u201d\` : 'link no texto';
+  const placar = esperando
+    ? '<div class="sub">Sem n\\u00fameros ainda. Come\\u00e7a a contar quando a pr\\u00f3xima publica\\u00e7\\u00e3o sair.</div>'
+    : \`<div class="placar">
+        <div><b>\${num(m.comentarios)}</b>coment\\u00e1rios</div>
+        <div><b>\${num(m.dms_enviadas)}</b>conversas</div>
+        \${temBotao
+          ? \`<div><b>\${num(m.cliques)}</b>cliques</div>
+             <div><b>\${m.taxa_de_clique ?? 0}%</b>por conversa</div>\`
+          : '<div><b class="mudo">\\u2014</b>link no texto n\\u00e3o mede</div>'}
+        \${m.dms_recusadas ? \`<div><b class="ruim">\${num(m.dms_recusadas)}</b>recusaram</div>\` : ''}
+        \${m.erros ? \`<div><b class="ruim">\${num(m.erros)}</b>erros</div>\` : ''}
+      </div>\`;
+  return \`<div class="linha" data-id="\${r.id}">
+    \${capa(r)}
+    <div class="cresce"><h3>\${esc(r.nome)}</h3>
+      <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">\${(r.palavras_chave||[]).map((p)=>\`<span class="chip">\${esc(p)}</span>\`).join('')}</div>
+      <div class="sub">\${alcance(r)}, \${formato}\${r.pastas?.nome ? ', em ' + esc(r.pastas.nome) : ''}</div>
+      \${placar}
+    </div>
+    <span class="chip \${!r.ativa ? '' : esperando ? 'and' : 'ok'}">\${!r.ativa ? 'Pausada' : esperando ? 'Agendada' : 'Ativa'}</span>
+    <button class="btn sm" data-editar>Editar</button>
+    <button class="btn sm" data-alternar>\${r.ativa?'Pausar':'Ativar'}</button>
+    \${souAdmin() ? '<button class="btn sm" data-excluir>Excluir</button>' : ''}
+  </div>\`;
+}
+
+async function alternar(r){
+  const { error } = await sb.from('regras').update({ ativa: !r.ativa, atualizado_por: sessao.user.id }).eq('id', r.id);
+  if (error) return toast(error.message);
+  abaAutomacoes();
+  toast(r.ativa ? 'Automa\\u00e7\\u00e3o pausada' : 'Automa\\u00e7\\u00e3o ativada', 'Desfazer', async () => {
+    await sb.from('regras').update({ ativa: r.ativa }).eq('id', r.id); abaAutomacoes();
+  });
+}
+async function duplicar(r){
+  const { id, criado_em, atualizado_em, pastas, ...resto } = r;
+  const { error } = await sb.from('regras').insert({ ...resto, nome: r.nome + ' (c\\u00f3pia)', ativa:false,
+    codigo_curto: Math.random().toString(36).slice(2,8), criado_por: sessao.user.id });
+  if (error) return toast(error.message);
+  abaAutomacoes(); toast('Automa\\u00e7\\u00e3o duplicada, pausada');
+}
+async function excluir(r){
+  const { error } = await sb.from('regras').delete().eq('id', r.id);
+  if (error) return toast('S\\u00f3 administrador pode excluir. Pause no lugar.');
+  abaAutomacoes(); toast('Automa\\u00e7\\u00e3o exclu\\u00edda');
+}
+
+/* ------------------------------------------- assistente em tres etapas */
+
+let rascunho = null, etapa = 1, publicacoesCache = null;
+
+function assistente(regra){
+  const e = regra ?? {};
+  rascunho = {
+    id: e.id ?? null, nome: e.nome ?? '', alvo: e.alvo ?? 'publicacao',
+    pasta_id: e.pasta_id ?? '', media_id: e.media_id ?? null,
+    permalink: e.permalink ?? null, miniatura_url: e.miniatura_url ?? null, legenda: '',
+    palavras: (e.palavras_chave ?? []).join(', '), link: e.link ?? '',
+    rotulo_botao: e.rotulo_botao ?? '',
+    mensagem: e.mensagem_dm ?? 'Oi! Que bom ter voc\\u00ea por aqui.\\n\\nAqui est\\u00e1 o que voc\\u00ea pediu: [link]',
+    publica: e.resposta_publica ?? '', recusa: e.resposta_publica_recusa ?? '',
+  };
+  etapa = 1;
+  desenharEtapa();
+}
+
+function trilha(){
+  const nomes = ['Gatilho','Mensagem','Confirma\\u00e7\\u00e3o'];
+  return \`<ol class="passos">\${nomes.map((n,i) => {
+    const k = i + 1;
+    const classe = k === etapa ? 'aqui' : (k < etapa ? 'feito' : '');
+    const bolha = k < etapa
+      ? '<span class="bolha" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 16 16"><path d="M3 8.5l3.2 3.2L13 5" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg></span>'
+      : \`<span class="bolha">\${k}</span>\`;
+    return \`<li class="\${classe}">\${bolha}<span>\${n}</span></li>\`
+      + (k < 3 ? '<li class="risco" aria-hidden="true"></li>' : '');
+  }).join('')}</ol>\`;
+}
+
+function desenharEtapa(){
+  const c = document.getElementById('conteudo');
+  c.innerHTML = \`<div class="topo"><div class="cresce">
+      <p style="margin:0;font-size:12px;color:var(--tx3)">Automa\\u00e7\\u00f5es</p>
+      <h1>\${rascunho.id ? 'Editar automa\\u00e7\\u00e3o' : 'Nova automa\\u00e7\\u00e3o'}</h1></div>
+      <button class="btn ghost" id="xis">Cancelar</button></div>
+    \${trilha()}<div id="etapa"></div>\`;
+  document.getElementById('xis').onclick = () => abaAutomacoes();
+  ({ 1: etapaGatilho, 2: etapaMensagem, 3: etapaConfirmar })[etapa]();
+}
+
+async function etapaGatilho(){
+  const d = document.getElementById('etapa');
+  const { data: pastas } = await sb.from('pastas').select('*').order('criado_em');
+  const opcoes = [
+    ['publicacao','Uma publica\\u00e7\\u00e3o','A mais usada. Vale para um post ou reel espec\\u00edfico.'],
+    ['proxima','A pr\\u00f3xima que eu publicar','Fica aguardando e se prende ao pr\\u00f3ximo post que sair.'],
+    ['qualquer','Qualquer publica\\u00e7\\u00e3o','Rede de seguran\\u00e7a, s\\u00f3 onde n\\u00e3o houver automa\\u00e7\\u00e3o pr\\u00f3pria.'],
+  ];
+
+  d.innerHTML = \`<h2>Onde e quando responder?</h2>
+    <p class="sub" style="margin-bottom:24px">Escolha a publica\\u00e7\\u00e3o que vai receber os coment\\u00e1rios e as palavras que acionam a resposta.</p>
+    <div class="campo"><label for="nome">Nome</label><div>
+      <input id="nome" value="\${esc(rascunho.nome)}" placeholder="Edital de educa\\u00e7\\u00e3o patrimonial">
+      <span class="dica">\\u00c9 assim que a equipe encontra a automa\\u00e7\\u00e3o depois.</span></div></div>
+    \${(pastas ?? []).length ? \`<div class="campo"><label for="pasta">Pasta</label><div><select id="pasta">
+      <option value="">Sem pasta</option>
+      \${pastas.map((p)=>\`<option value="\${p.id}" \${p.id===rascunho.pasta_id?'selected':''}>\${esc(p.nome)}</option>\`).join('')}
+    </select></div></div>\` : ''}
+    <div class="campo"><label>Alcance</label><div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px">
+      \${opcoes.map(([v,t,s]) => \`<label style="display:block;border:\${rascunho.alvo===v?'2px':'1px'} solid \${rascunho.alvo===v?'var(--mag)':'var(--ln)'};background:var(--sup);border-radius:6px;padding:15px;cursor:pointer">
+        <span style="display:flex;align-items:center;gap:10px">
+          <input type="radio" name="alvo" value="\${v}" \${rascunho.alvo===v?'checked':''} style="width:18px;height:18px;accent-color:var(--mag)">
+          <span style="font-weight:600">\${t}</span></span>
+        <span style="display:block;font-size:13px;color:var(--tx2);margin:8px 0 0 28px">\${s}</span></label>\`).join('')}
+      </div></div></div>
+    <div class="campo" id="caixaposts"><label>Publica\\u00e7\\u00e3o</label><div>
+      <div class="posts" id="posts"></div></div></div>
+    <div class="campo"><label for="chaves">Palavras</label><div>
+      <input id="chaves" value="\${esc(rascunho.palavras)}" placeholder="edital, quero o edital">
+      <div id="lidas" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap"></div>
+      <div id="conflito"></div>
+      <span class="dica">Separe por v\\u00edrgula. N\\u00e3o diferencia mai\\u00fasculas nem acentos; basta a palavra aparecer no coment\\u00e1rio.</span></div></div>
+    <div style="display:flex;gap:12px;align-items:center;border-top:1px solid var(--ln);padding-top:20px;flex-wrap:wrap">
+      <span class="sub" style="flex:1;margin:0">Etapa 1 de 3</span>
+      <button class="btn pri" id="adiante">Continuar</button></div>\`;
+
+  d.querySelectorAll('input[name=alvo]').forEach((i) => {
+    i.onchange = () => { rascunho.alvo = i.value; if (i.value !== 'publicacao') rascunho.media_id = null; etapaGatilho(); };
+  });
+  const caixa = document.getElementById('caixaposts');
+  if (rascunho.alvo !== 'publicacao') caixa.style.display = 'none';
+  else carregarPosts();
+
+  const chaves = () => document.getElementById('chaves').value.split(',').map((s)=>s.trim()).filter(Boolean);
+  let espera;
+  const checar = () => {
+    document.getElementById('lidas').innerHTML = chaves().map((p)=>\`<span class="chip">\${esc(normalizar(p))}</span>\`).join('');
+    const cx = document.getElementById('conflito');
+    cx.innerHTML = '';
+    if (!chaves().length || (rascunho.alvo === 'publicacao' && !rascunho.media_id)) return;
+    clearTimeout(espera);
+    espera = setTimeout(async () => {
+      const { data } = await sb.rpc('conflitos_de_regra', { p_id: rascunho.id, p_alvo: rascunho.alvo,
+        p_media_id: rascunho.media_id, p_palavras: chaves() });
+      if (data?.length) cx.innerHTML = \`<div class="aviso atencao">A palavra <b>\${esc(data[0].palavra)}</b> j\\u00e1 \\u00e9 usada por <b>\${esc(data[0].nome)}</b> no mesmo alcance. S\\u00f3 uma das duas vai responder.</div>\`;
+    }, 400);
+  };
+  document.getElementById('chaves').oninput = checar;
+  checar();
+
+  document.getElementById('adiante').onclick = () => {
+    rascunho.nome = document.getElementById('nome').value.trim();
+    rascunho.pasta_id = document.getElementById('pasta')?.value || '';
+    rascunho.palavras = document.getElementById('chaves').value;
+    if (!rascunho.nome) return toast('D\\u00ea um nome \\u00e0 automa\\u00e7\\u00e3o');
+    if (rascunho.alvo === 'publicacao' && !rascunho.media_id) return toast('Escolha a publica\\u00e7\\u00e3o ou troque o alcance');
+    if (!chaves().length) return toast('Informe pelo menos uma palavra');
+    etapa = 2; desenharEtapa();
+  };
+}
+
+async function carregarPosts(){
+  const grade = document.getElementById('posts');
+  grade.innerHTML = '<p class="sub">Buscando publica\\u00e7\\u00f5es\\u2026</p>';
+  if (!publicacoesCache) {
+    try { publicacoesCache = await api('/api/publicacoes'); }
+    catch (err) {
+      grade.innerHTML = \`<div class="aviso">N\\u00e3o foi poss\\u00edvel buscar as publica\\u00e7\\u00f5es.<small>\${esc(String(err.message))}</small></div>\`;
+      return;
+    }
+  }
+  grade.innerHTML = publicacoesCache.map((p) => \`<button type="button" class="post" data-id="\${p.media_id}"
+    data-link="\${esc(p.permalink)}" data-mini="\${esc(p.miniatura||'')}" data-leg="\${esc(p.legenda||'')}"
+    aria-pressed="\${p.media_id===rascunho.media_id}">
+    <img src="\${esc(p.miniatura)}" alt="" loading="lazy"><small>\${esc(p.legenda||p.tipo)}</small></button>\`).join('');
+  grade.querySelectorAll('.post').forEach((b) => {
+    b.onclick = () => {
+      const marcada = b.getAttribute('aria-pressed') === 'true';
+      grade.querySelectorAll('.post').forEach((o) => o.setAttribute('aria-pressed','false'));
+      b.setAttribute('aria-pressed', marcada ? 'false' : 'true');
+      if (marcada) { rascunho.media_id = null; rascunho.legenda = ''; }
+      else {
+        rascunho.media_id = b.dataset.id; rascunho.permalink = b.dataset.link;
+        rascunho.miniatura_url = b.dataset.mini; rascunho.legenda = b.dataset.leg;
+      }
+    };
+  });
+}
+
+function etapaMensagem(){
+  const d = document.getElementById('etapa');
+  d.innerHTML = \`<div style="display:grid;grid-template-columns:minmax(340px,1fr) 300px;gap:36px;align-items:start" id="duas">
+    <div>
+      <h2>O que a pessoa recebe</h2>
+      <p class="sub" style="margin-bottom:24px">A mensagem chega no direct poucos segundos depois do coment\\u00e1rio.</p>
+      <div class="campo"><label for="link">Link</label><div>
+        <input id="link" type="url" inputmode="url" value="\${esc(rascunho.link)}" placeholder="https://caurs.gov.br/..."></div></div>
+      <div class="campo"><label for="rotulo">Texto do bot\\u00e3o</label><div>
+        <input id="rotulo" maxlength="20" value="\${esc(rascunho.rotulo_botao)}" placeholder="Ler a mat\\u00e9ria">
+        <div id="expbotao" class="dica"></div></div></div>
+      <div class="campo"><label for="msg">Mensagem</label><div>
+        <textarea id="msg" rows="5">\${esc(rascunho.mensagem)}</textarea>
+        <span class="dica"><span class="contador" id="contador"></span><span id="dicamsg"></span></span>
+        <div class="aviso info" style="margin:12px 0 0;font-size:13px">O Instagram entrega a mensagem como <b>texto puro</b>. N\\u00e3o h\\u00e1 negrito, it\\u00e1lico nem tachado na API, e um marcador digitado chegaria literal. Quebra de linha, par\\u00e1grafo e emoji funcionam normalmente.</div>
+      </div></div>
+      <div class="campo"><label for="pub">No post</label><div>
+        <input id="pub" value="\${esc(rascunho.publica)}" placeholder="Te enviamos no direct!">
+        <span class="dica">Opcional. Vira coment\\u00e1rio p\\u00fablico quando a mensagem \\u00e9 entregue.</span></div></div>
+      <div class="campo"><label for="rec">Se recusarem</label><div>
+        <input id="rec" value="\${esc(rascunho.recusa)}" placeholder="O link est\\u00e1 na bio.">
+        <span class="dica">Opcional. Para quem bloqueia mensagens de perfis comerciais.</span></div></div>
+      <div style="display:flex;gap:12px;align-items:center;border-top:1px solid var(--ln);padding-top:20px;flex-wrap:wrap">
+        <button class="btn" id="voltar">Voltar</button>
+        <span class="sub" style="flex:1;margin:0">Etapa 2 de 3</span>
+        <button class="btn pri" id="adiante">Continuar</button></div>
+    </div>
+    <aside>
+      <h3 style="font-size:13px;color:var(--tx2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px">Pr\\u00e9via</h3>
+      <div id="previa"></div>
+    </aside></div>\`;
+
+  if (innerWidth < 980) document.getElementById('duas').style.gridTemplateColumns = '1fr';
+
+  const ver = () => {
+    const rotulo = document.getElementById('rotulo').value.trim();
+    const link = document.getElementById('link').value;
+    document.getElementById('expbotao').innerHTML = rotulo
+      ? 'A mensagem vai com bot\\u00e3o e nenhum endere\\u00e7o aparece. Os cliques s\\u00e3o contados. <b>O bot\\u00e3o n\\u00e3o aparece para quem l\\u00ea o direct pelo navegador do computador.</b>'
+      : 'Vazio, a mensagem vai como texto com o endere\\u00e7o inteiro \\u00e0 mostra, e os cliques n\\u00e3o s\\u00e3o contados.';
+    document.getElementById('dicamsg').textContent = rotulo
+      ? 'No modo bot\\u00e3o o [link] sai do texto, porque o endere\\u00e7o vive no bot\\u00e3o.'
+      : 'Use [link] onde o endere\\u00e7o deve entrar.';
+
+    const texto = textoDaMensagem(document.getElementById('msg').value, rotulo, link || 'https://\\u2026');
+    const n = bytes(texto);
+    const cont = document.getElementById('contador');
+    cont.textContent = \`\${n} de \${LIMITE_DM} bytes\`;
+    cont.className = 'contador' + (n > LIMITE_DM ? ' cheio' : '');
+
+    const pub = document.getElementById('pub').value;
+    document.getElementById('previa').innerHTML =
+      \`<div class="balao">\${esc(texto)}\${rotulo ? \`<span class="botaodm">\${esc(rotulo)}</span>\` : ''}</div>\`
+      + (pub ? \`<div class="balao pub" style="margin-top:10px"><b>@caursoficial</b> \${esc(pub)}</div>\` : '');
+  };
+  ['link','rotulo','msg','pub'].forEach((id) => { document.getElementById(id).oninput = ver; });
+  ver();
+
+  const guardar = () => {
+    rascunho.link = document.getElementById('link').value.trim();
+    rascunho.rotulo_botao = document.getElementById('rotulo').value.trim();
+    rascunho.mensagem = document.getElementById('msg').value;
+    rascunho.publica = document.getElementById('pub').value.trim();
+    rascunho.recusa = document.getElementById('rec').value.trim();
+  };
+  document.getElementById('voltar').onclick = () => { guardar(); etapa = 1; desenharEtapa(); };
+  document.getElementById('adiante').onclick = () => {
+    guardar();
+    if (!rascunho.link) return toast('Informe o link que a pessoa vai receber');
+    const n = bytes(textoDaMensagem(rascunho.mensagem, rascunho.rotulo_botao, rascunho.link));
+    if (n > LIMITE_DM) return toast(\`A mensagem tem \${n} bytes; o limite da Meta \\u00e9 \${LIMITE_DM}\`);
+    etapa = 3; desenharEtapa();
+  };
+}
+
+function etapaConfirmar(){
+  const d = document.getElementById('etapa');
+  const chaves = rascunho.palavras.split(',').map((s)=>s.trim()).filter(Boolean);
+  const onde = rascunho.alvo === 'qualquer' ? 'em <mark>qualquer publica\\u00e7\\u00e3o</mark>'
+    : rascunho.alvo === 'proxima' ? 'na <mark>pr\\u00f3xima publica\\u00e7\\u00e3o</mark> que sair'
+    : \`na publica\\u00e7\\u00e3o <a href="\${esc(rascunho.permalink||'#')}" target="_blank" rel="noopener">\${esc(rascunho.legenda || 'escolhida')}</a>\`;
+  const entrega = rascunho.rotulo_botao
+    ? \`enviar uma mensagem no direct com o bot\\u00e3o <mark>\${esc(rascunho.rotulo_botao)}</mark>\`
+    : 'enviar uma mensagem no direct com o link no texto';
+
+  d.innerHTML = \`<h2>Confira antes de ativar</h2>
+    <p class="sub" style="margin-bottom:24px">Leia como se fosse uma frase. Se fizer sentido, est\\u00e1 pronta.</p>
+    <div class="frase">Quando algu\\u00e9m comentar
+      \${chaves.map((p)=>\`<mark>\${esc(p)}</mark>\`).join(' ou ')}
+      \${onde}, \${entrega}\${rascunho.publica ? \` e responder no post <b>\\u201c\${esc(rascunho.publica)}\\u201d</b>\` : ''}.</div>
+    \${modoTeste ? '<div class="aviso atencao">O <b>modo de teste est\\u00e1 ligado</b>. S\\u00f3 as contas testadoras recebem a mensagem; quem comentar fora da lista fica registrado e n\\u00e3o recebe nada.</div>' : ''}
+    <div style="display:flex;gap:12px;align-items:center;border-top:1px solid var(--ln);padding-top:20px;flex-wrap:wrap;margin-top:22px">
+      <button class="btn" id="voltar">Voltar</button>
+      <span style="flex:1"></span>
+      <button class="btn" id="pausada">Salvar pausada</button>
+      <button class="btn pri" id="ativar">\${rascunho.id ? 'Salvar e ativar' : 'Ativar agora'}</button></div>\`;
+
+  document.getElementById('voltar').onclick = () => { etapa = 2; desenharEtapa(); };
+  document.getElementById('pausada').onclick = () => salvar(false);
+  document.getElementById('ativar').onclick = () => salvar(true);
+}
+
+async function salvar(ativa){
+  const dados = {
+    nome: rascunho.nome, alvo: rascunho.alvo,
+    media_id: rascunho.alvo === 'publicacao' ? rascunho.media_id : null,
+    permalink: rascunho.alvo === 'publicacao' ? rascunho.permalink : null,
+    miniatura_url: rascunho.alvo === 'publicacao' ? rascunho.miniatura_url : null,
+    pasta_id: rascunho.pasta_id || null,
+    palavras_chave: rascunho.palavras.split(',').map((s)=>s.trim()).filter(Boolean),
+    mensagem_dm: rascunho.mensagem, link: rascunho.link,
+    rotulo_botao: rascunho.rotulo_botao || null,
+    resposta_publica: rascunho.publica || null,
+    resposta_publica_recusa: rascunho.recusa || null,
+    ativa,
+  };
+  const { error } = rascunho.id
+    ? await sb.from('regras').update({ ...dados, atualizado_por: sessao.user.id }).eq('id', rascunho.id)
+    : await sb.from('regras').insert({ ...dados, codigo_curto: Math.random().toString(36).slice(2,8), criado_por: sessao.user.id });
+  if (error) return toast(error.message.replace(/^.*P0001:\\s*/, ''));
+  abaAutomacoes();
+  toast(ativa ? 'Automa\\u00e7\\u00e3o ativa' : 'Salva, pausada');
+}
+
+/* ------------------------------------------------------ nuvem de palavras */
+
+function desenharNuvem(el, itens){
+  if (!itens.length) return;
+  const L = Math.max(el.clientWidth || 680, 320);
+  const A = Math.round(L * (L < 560 ? 0.95 : 0.58));
+  const maior = itens[0][1], menor = itens[itens.length-1][1];
+  const cores = ['var(--tx)','var(--late)','var(--ok)','var(--rev)','var(--and)','var(--acc-tx)'];
+  const medidor = document.createElement('canvas').getContext('2d');
+  const ocupadas = [], postas = [];
+
+  itens.forEach(([palavra, n], i) => {
+    const t = maior === menor ? 1 : (n - menor) / (maior - menor);
+    const corpo = Math.round(14 + Math.pow(t, 0.6) * (L / 11));
+    const girada = i > 2 && i % 7 === 3;
+    medidor.font = \`700 \${corpo}px Manrope, sans-serif\`;
+    const larg = medidor.measureText(palavra).width + 4, alt = corpo * 0.98;
+    const cx = girada ? alt : larg, cy = girada ? larg : alt;
+
+    let x = 0, y = 0, coube = false;
+    for (let passo = 0; passo < 3000; passo++) {
+      const ang = passo * 0.3, raio = 1.9 * ang;
+      x = L/2 + raio * Math.cos(ang) - cx/2;
+      y = A/2 + raio * Math.sin(ang) * 0.58 - cy/2;
+      if (x < 1 || y < 1 || x + cx > L - 1 || y + cy > A - 1) continue;
+      const bate = ocupadas.some((o) =>
+        x < o.x + o.w + 2 && x + cx + 2 > o.x && y < o.y + o.h + 2 && y + cy + 2 > o.y);
+      if (!bate) { coube = true; break; }
+    }
+    if (!coube) return;
+    ocupadas.push({ x, y, w: cx, h: cy });
+    postas.push({ palavra, corpo, girada, cx: x + cx/2, cy: y + cy/2, cor: cores[i % cores.length], n });
+  });
+
+  el.innerHTML = \`<svg viewBox="0 0 \${L} \${A}" role="img" aria-label="Palavras mais comentadas">\`
+    + postas.map((p) => \`<text x="\${p.cx.toFixed(1)}" y="\${p.cy.toFixed(1)}" text-anchor="middle"
+        dominant-baseline="central" font-size="\${p.corpo}" font-weight="700" fill="\${p.cor}"
+        \${p.girada ? \`transform="rotate(-90 \${p.cx.toFixed(1)} \${p.cy.toFixed(1)})"\` : ''}>
+        <title>\${esc(p.palavra)} \\u2014 \${p.n} coment\\u00e1rios</title>\${esc(p.palavra)}</text>\`).join('')
+    + '</svg>';
+}
+
+/* --------------------------------------------------------- desempenho */
+
+/**
+ * Cada coluna carrega a propria explicacao, mostrada ao passar o mouse no
+ * cabecalho e repetida num glossario aberto embaixo. O mouse sozinho nao
+ * serve: nao existe em celular e nao chega a leitor de tela.
+ */
+const NOMEF = { CAROUSEL_ALBUM:'Carrossel', IMAGE:'Feed', VIDEO:'Reels' };
+const COLUNAS = {
+  data:              { nome:'Data', n:false, v:(p) => new Date(p.publicado_em).toLocaleDateString('pt-BR',{day:'2-digit',month:'short'}),
+                       ajuda:'Dia em que a publica\\u00e7\\u00e3o foi ao ar.' },
+  formato:           { nome:'Formato', n:false, v:(p) => NOMEF[p.formato] ?? (p.formato ?? ''),
+                       ajuda:'Como a Meta classifica a m\\u00eddia: Feed (imagem \\u00fanica), Carrossel (v\\u00e1rias) ou Reels (v\\u00eddeo).' },
+  alcance:           { nome:'Alcance', n:true,
+                       ajuda:'Contas \\u00fanicas que viram a publica\\u00e7\\u00e3o. Quem volta a ver conta uma vez s\\u00f3.' },
+  visualizacoes:     { nome:'Visualiza\\u00e7\\u00f5es', n:true,
+                       ajuda:'Quantas vezes a publica\\u00e7\\u00e3o foi exibida, somando as repeti\\u00e7\\u00f5es da mesma pessoa. \\u00c9 sempre maior ou igual ao alcance.' },
+  interacoes:        { nome:'Intera\\u00e7\\u00f5es', n:true,
+                       ajuda:'Soma de curtidas, coment\\u00e1rios, salvamentos e compartilhamentos.' },
+  taxa_interacao:    { nome:'Por alcance', n:true, pct:true,
+                       ajuda:'Intera\\u00e7\\u00f5es dividido por alcance, vezes 100. Quanto de quem viu reagiu de alguma forma. Normaliza post grande e pequeno.' },
+  curtidas:          { nome:'Curtidas', n:true,
+                       ajuda:'Cora\\u00e7\\u00f5es na publica\\u00e7\\u00e3o. O sinal mais barato: custa um toque.' },
+  comentarios:       { nome:'Coment\\u00e1rios', n:true,
+                       ajuda:'Coment\\u00e1rios recebidos, incluindo os que n\\u00e3o acionam automa\\u00e7\\u00e3o.' },
+  salvamentos:       { nome:'Salvos', n:true,
+                       ajuda:'Quem guardou para ver depois. Sinal de conte\\u00fado \\u00fatil, n\\u00e3o s\\u00f3 agrad\\u00e1vel.' },
+  compartilhamentos: { nome:'Compartilhados', n:true,
+                       ajuda:'Quem repassou no direct ou nos stories. \\u00c9 o que leva a publica\\u00e7\\u00e3o para fora de quem j\\u00e1 segue.' },
+  intencao:          { nome:'Salvos+comp.', n:true,
+                       ajuda:'Salvamentos mais compartilhamentos. Os dois gestos que exigem decis\\u00e3o, por isso dizem mais que a curtida.' },
+  dms_enviadas:      { nome:'Conversas', n:true,
+                       ajuda:'Mensagens entregues no direct pela automa\\u00e7\\u00e3o desta publica\\u00e7\\u00e3o.' },
+  cliques:           { nome:'Cliques', n:true,
+                       ajuda:'Aberturas do link curto, j\\u00e1 descontados rastreadores e repeti\\u00e7\\u00f5es da mesma origem em 90 segundos. S\\u00f3 existe no modo bot\\u00e3o.' },
+};
+const PADRAO = ['data','formato','alcance','visualizacoes','interacoes','taxa_interacao'];
+
+let periodo = 90, ordem = 'taxa_interacao', soFormato = 'todos', soAutomacao = false;
+let colunas = (() => {
+  try {
+    const g = JSON.parse(localStorage.getItem('colunas') || 'null');
+    if (Array.isArray(g) && g.length && g.every((k) => COLUNAS[k])) return g;
+  } catch { /* usa o padrao */ }
+  return [...PADRAO];
+})();
+
+const mediana = (xs) => {
+  const v = xs.filter((n) => n != null).map(Number).sort((a,b) => a-b);
+  if (!v.length) return null;
+  const m = Math.floor(v.length/2);
+  return v.length % 2 ? v[m] : Math.round((v[m-1]+v[m])/2);
+};
+const celula = (p, k) => {
+  const c = COLUNAS[k];
+  if (!c.n) return c.v(p);
+  const bruto = p[k];
+  if (bruto == null) return '\\u2014';
+  return c.pct ? bruto + '%' : num(bruto);
+};
+
+async function abaDesempenho(){
+  const c = document.getElementById('conteudo');
+  c.innerHTML = tarja() + '<p class="sub">Somando n\\u00fameros\\u2026</p>';
+  const desde = new Date(Date.now() - periodo * 86400000).toISOString().slice(0,10);
+
+  const [{ data: posts }, { data: palavras }, { data: regras }] = await Promise.all([
+    sb.from('desempenho_por_publicacao').select('*').gte('publicado_em', desde),
+    sb.from('palavras').select('palavra,contagem,dia').gte('dia', desde).limit(5000),
+    sb.from('desempenho_por_regra').select('*'),
+  ]);
+
+  const todos = posts ?? [];
+  const somaP = (k) => todos.reduce((t,p) => t + Number(p[k] ?? 0), 0);
+  const somaR = (k) => (regras ?? []).reduce((t,l) => t + Number(l[k] ?? 0), 0);
+  const alcanceTotal = somaP('alcance'), interacoes = somaP('interacoes');
+
+  const ag = {};
+  (palavras ?? []).forEach((p) => { ag[p.palavra] = (ag[p.palavra] ?? 0) + p.contagem; });
+  const nuvem = Object.entries(ag).sort((a,b) => b[1]-a[1]).slice(0,60);
+
+  const filtrados = todos.filter((p) =>
+    (soFormato === 'todos' || p.formato === soFormato) &&
+    (!soAutomacao || p.tem_automacao) &&
+    Number(p.alcance ?? 0) >= 300);
+  const ordenados = [...filtrados].sort((a,b) => Number(b[ordem] ?? 0) - Number(a[ordem] ?? 0));
+
+  const porFormato = ['CAROUSEL_ALBUM','IMAGE','VIDEO'].map((f) => {
+    const g = todos.filter((p) => p.formato === f);
+    return { f, n: g.length, alcance: mediana(g.map((p) => p.alcance)),
+      taxa: mediana(g.map((p) => p.taxa_interacao)) };
+  }).filter((x) => x.n);
+
+  c.innerHTML = tarja() + \`<div class="topo"><div class="cresce"><h1>Desempenho</h1>
+      <p>O que o perfil publicou no per\\u00edodo e o que funcionou, para orientar o que vem depois.</p></div>
+      <button class="btn" id="csv">Baixar planilha</button></div>
+    <div class="pastas">
+      <span class="sub" style="margin:0;font-weight:600">Per\\u00edodo</span>
+      <button class="chipsel mini" data-per="30" aria-pressed="\${periodo===30}">30 dias</button>
+      <button class="chipsel mini" data-per="90" aria-pressed="\${periodo===90}">90 dias</button>
+      <button class="chipsel mini" data-per="365" aria-pressed="\${periodo===365}">Este ano</button>
+    </div>
+    <div class="numeros">
+      <div class="numero"><b class="grande">\${num(alcanceTotal)}</b><span>contas alcan\\u00e7adas</span></div>
+      <div class="numero"><b>\${num(interacoes)}</b><span>intera\\u00e7\\u00f5es</span>
+        \${alcanceTotal ? \`<em>\${(100*interacoes/alcanceTotal).toFixed(1)}% de quem foi alcan\\u00e7ado</em>\` : ''}</div>
+      <div class="numero"><b>\${num(somaR('dms_enviadas'))}</b><span>conversas iniciadas</span>
+        <em style="color:var(--tx2);font-weight:400">\${num(somaR('cliques'))} abriram o link</em></div>
+      <div class="numero"><b>\${num(todos.length)}</b><span>publica\\u00e7\\u00f5es</span></div>
+    </div>
+    \${todos.length ? '' : '<div class="aviso info">Nenhuma publica\\u00e7\\u00e3o com m\\u00e9tricas no per\\u00edodo. Em Ajustes, rode <b>Ler m\\u00e9tricas</b> at\\u00e9 a fila esvaziar.</div>'}
+
+    <h2 style="margin:28px 0 12px">Publica\\u00e7\\u00f5es</h2>
+    <div class="barra">
+      <h3>Colunas da tabela</h3>
+      <div class="pastas">\${Object.entries(COLUNAS).map(([k,v]) =>
+        \`<button class="chipsel mini" data-col="\${k}" aria-pressed="\${colunas.includes(k)}" title="\${esc(v.ajuda)}">\${v.nome}</button>\`).join('')}
+        <button class="btn sm" id="colpadrao" style="margin-left:auto">Voltar ao padr\\u00e3o</button></div>
+    </div>
+    <div class="pastas">
+      <label class="sub" style="margin:0" for="fmt">Formato</label>
+      <select id="fmt" style="width:auto;min-height:44px">
+        <option value="todos">Todos</option>
+        <option value="IMAGE" \${soFormato==='IMAGE'?'selected':''}>Feed</option>
+        <option value="VIDEO" \${soFormato==='VIDEO'?'selected':''}>Reels</option>
+        <option value="CAROUSEL_ALBUM" \${soFormato==='CAROUSEL_ALBUM'?'selected':''}>Carrossel</option>
+      </select>
+      <label class="sub" style="margin:0;display:flex;align-items:center;gap:8px;cursor:pointer;min-height:44px">
+        <input type="checkbox" id="soauto" \${soAutomacao?'checked':''} style="width:17px;height:17px;accent-color:var(--mag)"> S\\u00f3 com automa\\u00e7\\u00e3o</label>
+      <span class="sub" style="margin:0;margin-left:auto">\${ordenados.length} publica\\u00e7\\u00f5es</span>
+    </div>
+    \${ordenados.length ? \`<div class="lista rolavel"><table>
+      <thead><tr><th>Publica\\u00e7\\u00e3o</th>
+        \${colunas.map((k) => \`<th class="\${COLUNAS[k].n?'n ':''}ordenavel" data-ord="\${k}"
+          \${ordem===k?'aria-sort="descending"':''}><span class="marcaajuda" title="\${esc(COLUNAS[k].ajuda)}">\${COLUNAS[k].nome}</span>\${ordem===k?' \\u2193':''}</th>\`).join('')}
+      </tr></thead>
+      <tbody>\${ordenados.slice(0,80).map((p) => \`<tr>
+        <td class="titulo"><div style="display:flex;gap:10px;align-items:center">
+          \${p.miniatura_url ? \`<img class="capinha" src="\${esc(p.miniatura_url)}" alt="" loading="lazy">\` : ''}
+          <a href="\${esc(p.permalink||'#')}" target="_blank" rel="noopener" style="color:var(--tx);font-weight:500">\${esc((p.legenda||'Sem legenda').slice(0,70))}</a>
+          \${p.tem_automacao ? '<span class="chip ok">auto</span>' : ''}</div></td>
+        \${colunas.map((k) => \`<td class="\${COLUNAS[k].n?'n':''}">\${esc(celula(p,k))}</td>\`).join('')}
+      </tr>\`).join('')}</tbody></table></div>
+      <details class="glossario"><summary>O que significa cada coluna</summary>
+        <dl>\${colunas.map((k) => \`<div><dt>\${COLUNAS[k].nome}</dt><dd>\${COLUNAS[k].ajuda}</dd></div>\`).join('')}</dl>
+        <p class="sub">Os n\\u00fameros vindos da Meta podem levar at\\u00e9 48 horas para consolidar, ent\\u00e3o os \\u00faltimos dias s\\u00e3o provis\\u00f3rios.</p></details>
+      <p class="sub" style="margin-top:12px">Ordenado por <b>\${COLUNAS[ordem].nome}</b>; clique num cabe\\u00e7alho para trocar. Publica\\u00e7\\u00f5es com alcance abaixo de 300 ficam fora, para uma taxa alta sobre pouca gente n\\u00e3o liderar a lista. Mostrando at\\u00e9 80; a planilha traz todas.</p>\`
+      : '<div class="vazio"><b>Nada neste recorte</b><span>Troque o per\\u00edodo, o formato ou rode a sincroniza\\u00e7\\u00e3o em Ajustes.</span></div>'}
+
+    \${porFormato.length ? \`<h2 style="margin:28px 0 6px">Qual formato est\\u00e1 rendendo</h2>
+    <p class="sub" style="margin:0 0 12px">Mediana, n\\u00e3o m\\u00e9dia, para um post fora da curva n\\u00e3o distorcer a leitura.</p>
+    <div class="numeros">\${porFormato.map((x) => \`<div class="numero">
+      <span style="font-weight:600;color:var(--tx)">\${NOMEF[x.f]}</span> <span>\\u00b7 \${x.n} posts</span>
+      <b style="font-size:22px;margin-top:8px">\${x.taxa ?? 0}%</b><span>intera\\u00e7\\u00f5es por alcance</span>
+      <em style="color:var(--tx2);font-weight:400">alcance mediano \${num(x.alcance)}</em></div>\`).join('')}</div>\` : ''}
+
+    <h2 style="margin:28px 0 12px">O que as pessoas comentam</h2>
+    <div class="cartao">\${nuvem.length ? '<div class="nuvem" id="nuvem"></div>'
+      : '<p class="sub">Nenhuma palavra contabilizada no per\\u00edodo. Em Ajustes, rode <b>Somar palavras</b>.</p>'}
+      <p class="sub" style="margin-top:14px">Contagem agregada, com o n\\u00famero ao passar o mouse. O sistema n\\u00e3o guarda o texto nem o autor dos coment\\u00e1rios que n\\u00e3o acionam uma automa\\u00e7\\u00e3o.</p></div>
+
+    <h2 style="margin:28px 0 12px">Por automa\\u00e7\\u00e3o</h2>
+    \${(regras ?? []).length ? \`<div class="lista rolavel"><table>
+      <thead><tr><th>Automa\\u00e7\\u00e3o</th><th class="n">Coment\\u00e1rios</th><th class="n">Conversas</th>
+      <th class="n">Recusadas</th><th class="n">Cliques</th><th class="n">Por conversa</th></tr></thead>
+      <tbody>\${regras.map((l) => \`<tr><td class="titulo">\${esc(l.nome)}</td><td class="n">\${num(l.comentarios)}</td>
+        <td class="n">\${num(l.dms_enviadas)}</td><td class="n">\${num(l.dms_recusadas)}</td>
+        <td class="n">\${num(l.cliques)}</td><td class="n">\${l.taxa_de_clique}%</td></tr>\`).join('')}</tbody></table></div>\`
+      : '<div class="vazio"><b>Ainda n\\u00e3o h\\u00e1 envios para medir</b><span>Os n\\u00fameros aparecem depois da primeira mensagem.</span></div>'}\`;
+  ligarTarja();
+
+  c.querySelectorAll('[data-per]').forEach((b) => { b.onclick = () => { periodo = Number(b.dataset.per); abaDesempenho(); }; });
+  c.querySelectorAll('[data-ord]').forEach((b) => { b.onclick = () => { ordem = b.dataset.ord; abaDesempenho(); }; });
+  c.querySelectorAll('[data-col]').forEach((b) => {
+    b.onclick = () => {
+      const k = b.dataset.col;
+      const nova = colunas.includes(k) ? colunas.filter((x) => x !== k) : [...colunas, k];
+      if (!nova.length) return toast('Deixe pelo menos uma coluna');
+      colunas = Object.keys(COLUNAS).filter((x) => nova.includes(x));
+      if (!colunas.includes(ordem)) ordem = colunas.find((x) => COLUNAS[x].n) ?? 'alcance';
+      try { localStorage.setItem('colunas', JSON.stringify(colunas)); } catch { /* sem memoria */ }
+      abaDesempenho();
+    };
+  });
+  document.getElementById('colpadrao').onclick = () => {
+    colunas = [...PADRAO]; ordem = 'taxa_interacao';
+    try { localStorage.setItem('colunas', JSON.stringify(colunas)); } catch { /* sem memoria */ }
+    abaDesempenho();
+  };
+  document.getElementById('fmt').onchange = (ev) => { soFormato = ev.target.value; abaDesempenho(); };
+  document.getElementById('soauto').onchange = (ev) => { soAutomacao = ev.target.checked; abaDesempenho(); };
+
+  const alvoNuvem = document.getElementById('nuvem');
+  if (alvoNuvem) desenharNuvem(alvoNuvem, nuvem);
+
+  document.getElementById('csv').onclick = () => {
+    const cabecalho = ['Publicacao','Link', ...colunas.map((k) => COLUNAS[k].nome)];
+    const linhas = ordenados.map((p) => [
+      (p.legenda || '').replace(/[\\r\\n]+/g,' '), p.permalink ?? '',
+      ...colunas.map((k) => COLUNAS[k].n ? (p[k] ?? '') : COLUNAS[k].v(p)),
+    ]);
+    const tudo = [cabecalho, ...linhas]
+      .map((r) => r.map((v) => '"' + String(v ?? '').replace(/"/g,'""') + '"').join(';')).join('\\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['\\ufeff' + tudo], { type:'text/csv;charset=utf-8' }));
+    a.download = \`desempenho-caurs-\${periodo}d.csv\`; a.click();
+    toast(\`Planilha com \${linhas.length} publica\\u00e7\\u00f5es\`);
+  };
+}
+
+/* ------------------------------------------------------------ usuarios */
+
+async function abaUsuarios(){
+  const c = document.getElementById('conteudo');
+  c.innerHTML = '<p class="sub">Carregando\\u2026</p>';
+  let pessoas = [];
+  try { pessoas = await api('/api/usuarios'); }
+  catch (err) { c.innerHTML = \`<div class="aviso">\${esc(err.message)}</div>\`; return; }
+
+  c.innerHTML = \`<div class="topo"><div class="cresce"><h1>Usu\\u00e1rios</h1>
+      <p>Quem entra no painel e o que cada pessoa pode fazer.</p></div>
+      \${souAdmin() ? '<button class="btn pri" id="nova">Adicionar pessoa</button>' : ''}</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px;margin-bottom:24px">
+      <div class="cartao"><h3>Administrador</h3><p class="sub">Faz tudo o que o editor faz, e mais: excluir automa\\u00e7\\u00e3o, mexer em ajustes, ligar e desligar o modo de teste, e gerir pessoas.</p></div>
+      <div class="cartao"><h3>Editor</h3><p class="sub">Cria, edita, duplica e pausa automa\\u00e7\\u00f5es. V\\u00ea o desempenho. N\\u00e3o exclui nem altera configura\\u00e7\\u00e3o do sistema.</p></div>
+    </div>
+    <div id="formpessoa"></div>
+    <div class="lista">\${pessoas.map((p) => \`<div class="linha" data-pid="\${p.id}">
+      <span class="inicial" aria-hidden="true">\${esc(iniciais(p.nome))}</span>
+      <div class="cresce">
+        <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap">
+          <h3 data-nome>\${esc(p.nome)}</h3>
+          \${p.id === sessao.user.id ? '<span class="chip rev">voc\\u00ea</span>' : ''}
+          \${p.trocar_senha ? '<span class="chip and">senha provis\\u00f3ria</span>' : ''}</div>
+        <div class="sub">\${esc(p.email ?? '')}</div></div>
+      <div style="min-width:140px">
+        <div style="font-size:13.5px;font-weight:600">\${p.papel === 'administrador' ? 'Administrador' : 'Editor'}</div>
+        <div class="sub" style="margin:0">\${esc(quando(p.ultimo_acesso))}</div></div>
+      \${(souAdmin() || p.id === sessao.user.id) ? '<button class="btn sm" data-renomear>Renomear</button>' : ''}
+      \${souAdmin() ? '<button class="btn sm" data-acoes>A\\u00e7\\u00f5es</button>' : ''}
+    </div>\`).join('')}</div>\`;
+
+  const nova = document.getElementById('nova');
+  if (nova) nova.onclick = () => formPessoa();
+
+  c.querySelectorAll('[data-renomear]').forEach((b) => {
+    const linha = b.closest('[data-pid]');
+    const p = pessoas.find((x) => x.id === linha.dataset.pid);
+    b.onclick = () => renomear(p, linha);
+  });
+
+  c.querySelectorAll('[data-acoes]').forEach((b) => {
+    const linha = b.closest('[data-pid]');
+    const p = pessoas.find((x) => x.id === linha.dataset.pid);
+    b.onclick = (ev) => menuContexto(ev, [
+      { texto:'Renomear', acao: () => renomear(p, linha) },
+      { texto: p.papel === 'administrador' ? 'Tornar editor' : 'Tornar administrador', acao: () => mudarPapel(p) },
+      { texto:'Gerar senha provis\\u00f3ria', acao: () => novaSenha(p) },
+      '-', { texto:'Excluir conta', perigo:true, acao: () => excluirPessoa(p) },
+    ]);
+  });
+}
+
+// Edicao no lugar: troca o titulo por um campo, sem tirar a pessoa da lista.
+function renomear(p, linha){
+  const alvo = linha.querySelector('[data-nome]');
+  if (alvo.dataset.editando) return;
+  alvo.dataset.editando = '1';
+  const antes = p.nome;
+  alvo.innerHTML = \`<input id="renome" value="\${esc(antes)}" maxlength="80"
+    style="width:min(280px,60vw);padding:7px 10px;font-size:15px;font-weight:600">\`;
+  const campo = document.getElementById('renome');
+  campo.focus(); campo.select();
+
+  const concluir = async (manter) => {
+    const nome = campo.value.trim();
+    if (!manter || nome === antes) { alvo.textContent = antes; delete alvo.dataset.editando; return; }
+    if (nome.length < 2) { toast('O nome precisa de pelo menos 2 letras'); campo.focus(); return; }
+    try {
+      await api('/api/usuarios', { method:'PATCH', body: JSON.stringify({ id:p.id, acao:'nome', nome }) });
+      if (p.id === sessao.user.id) perfil.nome = nome;
+      await abaUsuarios();
+      toast('Nome atualizado');
+    } catch (err) {
+      alvo.textContent = antes; delete alvo.dataset.editando;
+      toast(err.message);
+    }
+  };
+  campo.onkeydown = (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); concluir(true); }
+    if (ev.key === 'Escape') concluir(false);
+  };
+  campo.onblur = () => concluir(true);
+}
+
+function formPessoa(){
+  const f = document.getElementById('formpessoa');
+  f.innerHTML = \`<div class="cartao" style="margin-bottom:20px">
+    <h2 style="margin-bottom:16px">Adicionar pessoa</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:16px">
+      <div><label class="rotulo" style="margin-top:0" for="pnome">Nome</label><input id="pnome" placeholder="Marina Pires"></div>
+      <div><label class="rotulo" style="margin-top:0" for="pmail">E-mail institucional</label><input id="pmail" type="email" placeholder="nome@caurs.gov.br"></div>
+      <div><label class="rotulo" style="margin-top:0" for="ppapel">Papel</label><select id="ppapel"><option value="editor">Editor</option><option value="administrador">Administrador</option></select></div>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn pri" id="criar">Criar conta</button>
+      <button class="btn ghost" id="fechar">Cancelar</button></div>
+    <div id="saidapessoa"></div></div>\`;
+  f.scrollIntoView({ behavior:'smooth', block:'start' });
+  document.getElementById('fechar').onclick = () => { f.innerHTML = ''; };
+  document.getElementById('criar').onclick = async () => {
+    const b = document.getElementById('criar');
+    b.disabled = true;
+    try {
+      const feito = await api('/api/usuarios', { method:'POST', body: JSON.stringify({
+        nome: document.getElementById('pnome').value.trim(),
+        email: document.getElementById('pmail').value.trim(),
+        papel: document.getElementById('ppapel').value }) });
+      mostrarSenha(feito.nome, feito.senha);
+    } catch (err) {
+      document.getElementById('saidapessoa').innerHTML = \`<div class="aviso">\${esc(err.message)}</div>\`;
+    }
+    b.disabled = false;
+  };
+}
+
+function mostrarSenha(nome, senha){
+  const f = document.getElementById('formpessoa');
+  f.innerHTML = \`<div class="aviso ok" style="margin:0 0 20px">
+    <p style="margin:0 0 14px">Conta de <b>\${esc(nome)}</b> pronta. Entregue a senha abaixo pessoalmente ou por um canal interno. A pessoa cria a pr\\u00f3pria senha ao entrar.</p>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <code class="chaveprov">\${esc(senha)}</code>
+      <button class="btn" id="copiar">Copiar</button>
+      <button class="btn ghost" id="pronto">Pronto</button></div>
+    <p style="margin:14px 0 0;font-size:12.5px">Esta senha aparece uma \\u00fanica vez. Fechando o aviso, n\\u00e3o h\\u00e1 como v\\u00ea-la de novo; s\\u00f3 gerar outra.</p></div>\`;
+  document.getElementById('copiar').onclick = async () => {
+    try { await navigator.clipboard.writeText(senha); toast('Senha copiada'); }
+    catch { toast('Copie manualmente'); }
+  };
+  document.getElementById('pronto').onclick = () => abaUsuarios();
+}
+
+async function mudarPapel(p){
+  const papel = p.papel === 'administrador' ? 'editor' : 'administrador';
+  try {
+    await api('/api/usuarios', { method:'PATCH', body: JSON.stringify({ id:p.id, acao:'papel', papel }) });
+    abaUsuarios(); toast(\`\${p.nome} agora \\u00e9 \${papel}\`);
+  } catch (err) { toast(err.message); }
+}
+
+async function novaSenha(p){
+  try {
+    const feito = await api('/api/usuarios', { method:'PATCH', body: JSON.stringify({ id:p.id, acao:'senha' }) });
+    await abaUsuarios();
+    mostrarSenha(p.nome, feito.senha);
+  } catch (err) { toast(err.message); }
+}
+
+async function excluirPessoa(p){
+  if (!confirm(\`Excluir a conta de \${p.nome}? Isso n\\u00e3o pode ser desfeito.\`)) return;
+  try {
+    await api('/api/usuarios', { method:'DELETE', body: JSON.stringify({ id:p.id }) });
+    abaUsuarios(); toast('Conta exclu\\u00edda');
+  } catch (err) { toast(err.message); }
+}
+
+/* ------------------------------------------------------------ ajustes */
+
+async function abaAjustes(){
+  const c = document.getElementById('conteudo');
+  const { data: testadores } = await sb.from('testadores').select('*').order('username');
+  const escuro = document.documentElement.dataset.theme === 'dark';
+
+  c.innerHTML = \`<div class="topo"><div class="cresce"><h1>Ajustes</h1></div></div>
+    <div class="cartao" style="margin-bottom:16px"><h2>Modo de teste</h2>
+      <p class="sub">\${modoTeste ? 'Ligado. S\\u00f3 as contas abaixo recebem mensagem; o resto \\u00e9 registrado e ignorado.'
+        : 'Desligado. Qualquer pessoa que comentar uma palavra-chave recebe mensagem.'}</p>
+      \${souAdmin() ? \`<button class="btn \${modoTeste?'pri':''}" id="modo" style="margin-top:14px">\${modoTeste?'Desligar modo de teste':'Ligar modo de teste'}</button>\`
+        : '<p class="sub">S\\u00f3 administrador pode mudar.</p>'}</div>
+    <div class="cartao" style="margin-bottom:16px"><h2>Contas testadoras</h2>
+      <p class="sub" style="margin-bottom:14px">Quem recebe mensagem enquanto o modo de teste est\\u00e1 ligado.</p>
+      \${(testadores ?? []).length ? \`<div class="lista">\${testadores.map((t) => \`<div class="linha">
+        <div class="cresce">@\${esc(t.username)}</div>
+        \${souAdmin() ? \`<button class="btn sm" data-remover="\${t.id}">Remover</button>\` : ''}</div>\`).join('')}</div>\`
+        : '<p class="sub">Nenhuma conta cadastrada.</p>'}
+      <div style="display:flex;gap:8px;margin-top:14px"><input id="novo" placeholder="mastercouto">
+        <button class="btn pri" id="add" style="white-space:nowrap">Adicionar</button></div></div>
+    \${souAdmin() ? \`<div class="cartao" style="margin-bottom:16px"><h2>Dados das publica\\u00e7\\u00f5es</h2>
+      <p class="sub" style="margin-bottom:14px">Cataloga os posts de 2026, l\\u00ea alcance e intera\\u00e7\\u00f5es, e soma as palavras dos coment\\u00e1rios antigos. Roda 20 por vez; clique de novo at\\u00e9 a fila esvaziar. Evite rodar enquanto estiver testando o envio.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" data-sinc="posts">1. Catalogar publica\\u00e7\\u00f5es</button>
+        <button class="btn" data-sinc="metricas">2. Ler m\\u00e9tricas</button>
+        <button class="btn" data-sinc="palavras">3. Somar palavras</button>
+      </div><div id="sincsaida"></div></div>\` : ''}
+    <div class="cartao" style="margin-bottom:16px"><h2>Minha senha</h2>
+      <div style="display:flex;gap:8px;margin-top:12px"><input id="nsenha" type="password" autocomplete="new-password" placeholder="Nova senha, no m\\u00ednimo 8 caracteres">
+        <button class="btn pri" id="trocar" style="white-space:nowrap">Trocar</button></div></div>
+    <div class="cartao"><h2>Apar\\u00eancia</h2>
+      <p class="sub">Tema \${escuro?'escuro':'claro'}.</p>
+      <button class="btn" id="tema" style="margin-top:14px">Usar tema \${escuro?'claro':'escuro'}</button></div>
+    <p class="sub" style="margin-top:22px">Comenta e Recebe, vers\\u00e3o ${VERSAO}</p>\`;
+
+  const bmodo = document.getElementById('modo');
+  if (bmodo) bmodo.onclick = async () => {
+    const { error } = await sb.from('configuracoes').update({ valor: !modoTeste }).eq('chave','modo_teste');
+    if (error) return toast('S\\u00f3 administrador pode mudar o modo de teste');
+    modoTeste = !modoTeste; desenhar();
+    toast(modoTeste ? 'Modo de teste ligado' : 'Modo de teste desligado');
+  };
+  document.getElementById('tema').onclick = () => {
+    const novo = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = novo;
+    localStorage.setItem('tema', novo); desenhar();
+  };
+  document.getElementById('trocar').onclick = async () => {
+    const nova = document.getElementById('nsenha').value;
+    if (nova.length < 8) return toast('A senha precisa de pelo menos 8 caracteres');
+    const { error } = await sb.auth.updateUser({ password: nova });
+    toast(error ? 'N\\u00e3o foi poss\\u00edvel trocar: ' + error.message : 'Senha trocada');
+    if (!error) document.getElementById('nsenha').value = '';
+  };
+  document.getElementById('add').onclick = async () => {
+    const u = document.getElementById('novo').value.trim().replace(/^@/,'');
+    if (!u) return;
+    await sb.from('testadores').insert({ username: u.toLowerCase() });
+    abaAjustes(); toast('Conta adicionada');
+  };
+  c.querySelectorAll('[data-remover]').forEach((b) => {
+    let armado = false;
+    b.onclick = async () => {
+      if (!armado) { armado = true; b.classList.add('armado'); b.textContent = 'Confirmar';
+        setTimeout(() => { armado = false; b.classList.remove('armado'); b.textContent = 'Remover'; }, 4000); return; }
+      const { error } = await sb.from('testadores').delete().eq('id', b.dataset.remover);
+      if (error) return toast('S\\u00f3 administrador pode remover');
+      abaAjustes(); toast('Conta removida');
+    };
+  });
+  c.querySelectorAll('[data-sinc]').forEach((b) => {
+    b.onclick = async () => {
+      const saida = document.getElementById('sincsaida');
+      const antes = b.textContent;
+      b.disabled = true; b.textContent = 'Rodando\\u2026';
+      try {
+        const corpo = await api('/api/sincronizar?o=' + b.dataset.sinc + '&lote=20');
+        saida.innerHTML = \`<div class="aviso info">\${esc(JSON.stringify(corpo))}</div>\`;
+      } catch (err) {
+        saida.innerHTML = \`<div class="aviso">\${esc(err.message)}</div>\`;
+      }
+      b.disabled = false; b.textContent = antes;
+    };
+  });
+}
+
+iniciar();
+</script></body></html>`;
