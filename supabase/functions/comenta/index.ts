@@ -703,6 +703,7 @@ async function pagina() {
   return PAGINA.replaceAll('__LOGO__', await pegarLogo());
 }
 
+/* === PAINEL: gerado por scripts/montar-painel.ts, nao edite a mao === */
 const PAGINA = `<!doctype html>
 <html lang="pt-BR" data-theme="light">
 <head>
@@ -1039,8 +1040,8 @@ const quando = (iso) => {
   const d = new Date(iso);
   const min = Math.round((new Date() - d) / 60000);
   if (min < 2) return 'agora mesmo';
-  if (min < 60) return \`h\\u00e1 \${min} minutos\`;
-  if (min < 1440) return \`h\\u00e1 \${Math.round(min/60)} horas\`;
+  if (min < 60) return \`há \${min} minutos\`;
+  if (min < 1440) return \`há \${Math.round(min/60)} horas\`;
   return d.toLocaleDateString('pt-BR', { day:'2-digit', month:'short' }) + ', '
        + d.toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit' });
 };
@@ -1072,19 +1073,19 @@ function telaTrocarSenha(aviso){
   app.innerHTML = \`<div class="formulario" style="min-height:100vh"><div class="caixa">
     \${marcaImg('width:190px;margin-bottom:28px')}
     <h2>Crie sua senha</h2>
-    <p class="sub">Voc\\u00ea entrou com uma senha provis\\u00f3ria. Escolha uma sua para continuar.</p>
+    <p class="sub">Você entrou com uma senha provisória. Escolha uma sua para continuar.</p>
     \${aviso ? \`<div class="aviso">\${esc(aviso)}</div>\` : ''}
     <label class="rotulo" for="n1">Nova senha</label>
     <input id="n1" type="password" autocomplete="new-password">
     <label class="rotulo" for="n2">Repita</label>
     <input id="n2" type="password" autocomplete="new-password">
     <button class="btn pri" id="ok" style="width:100%;margin-top:20px">Salvar e entrar</button>
-    <p class="primeiro">No m\\u00ednimo 8 caracteres. Depois disso a senha provis\\u00f3ria deixa de valer.</p>
+    <p class="primeiro">No mínimo 8 caracteres. Depois disso a senha provisória deixa de valer.</p>
   </div></div>\`;
   document.getElementById('ok').onclick = async () => {
     const a = document.getElementById('n1').value, b = document.getElementById('n2').value;
     if (a.length < 8) return telaTrocarSenha('A senha precisa de pelo menos 8 caracteres.');
-    if (a !== b) return telaTrocarSenha('As duas senhas n\\u00e3o conferem.');
+    if (a !== b) return telaTrocarSenha('As duas senhas não conferem.');
     const { error } = await sb.auth.updateUser({ password: a });
     if (error) return telaTrocarSenha(error.message);
     await sb.from('perfis').update({ trocar_senha:false }).eq('id', sessao.user.id);
@@ -1107,7 +1108,7 @@ function telaEntrar(msg, tipo){
         <button type="button" id="ver">Mostrar</button></div>
       <button class="btn pri" id="b" style="width:100%;margin-top:20px">Entrar</button>
       <button class="elo" id="esqueci">Esqueci minha senha</button>
-      <p class="primeiro"><b>Primeiro acesso?</b> Use a senha provis\\u00f3ria que a coordena\\u00e7\\u00e3o de Comunica\\u00e7\\u00e3o entregou. O sistema pede uma senha sua logo na entrada.</p>
+      <p class="primeiro"><b>Primeiro acesso?</b> Use a senha provisória que a coordenação de Comunicação entregou. O sistema pede uma senha sua logo na entrada.</p>
     </div></div>
     <div class="vitrine">
       <svg class="fundo" viewBox="0 0 600 800" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
@@ -1118,7 +1119,7 @@ function telaEntrar(msg, tipo){
         \${marcaImg()}
         <p class="conselho">Conselho de Arquitetura e Urbanismo do Rio Grande do Sul</p>
         <div class="produto"><h1>Comenta e Recebe</h1>
-          <p>Respostas autom\\u00e1ticas no Instagram, em um s\\u00f3 lugar.</p></div>
+          <p>Respostas automáticas no Instagram, em um só lugar.</p></div>
       </div>
     </div></div>\`;
 
@@ -1131,11 +1132,11 @@ function telaEntrar(msg, tipo){
   };
   const botao = document.getElementById('b');
   const entrar = async () => {
-    botao.disabled = true; botao.textContent = 'Entrando\\u2026';
+    botao.disabled = true; botao.textContent = 'Entrando…';
     const { error } = await sb.auth.signInWithPassword({
       email: document.getElementById('e').value.trim(),
       password: document.getElementById('s').value });
-    if (error) return telaEntrar('E-mail ou senha n\\u00e3o conferem. Confira os dados ou use a op\\u00e7\\u00e3o Esqueci minha senha.');
+    if (error) return telaEntrar('E-mail ou senha não conferem. Confira os dados ou use a opção Esqueci minha senha.');
     iniciar();
   };
   botao.onclick = entrar;
@@ -1145,11 +1146,11 @@ function telaEntrar(msg, tipo){
     const email = document.getElementById('e').value.trim();
     if (!email) return telaEntrar('Escreva seu e-mail antes de pedir a troca de senha.');
     await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname });
-    telaEntrar('Se o e-mail estiver cadastrado, voc\\u00ea vai receber um link para criar uma nova senha.', 'ok');
+    telaEntrar('Se o e-mail estiver cadastrado, você vai receber um link para criar uma nova senha.', 'ok');
   };
 }
 
-const ABAS = { automacoes:'Automa\\u00e7\\u00f5es', desempenho:'Desempenho', usuarios:'Usu\\u00e1rios', ajustes:'Ajustes' };
+const ABAS = { automacoes:'Automações', desempenho:'Desempenho', usuarios:'Usuários', ajustes:'Ajustes' };
 
 function desenhar(){
   app.innerHTML = \`<div class="layout">
@@ -1168,7 +1169,7 @@ function desenhar(){
       </div>
     </aside>
     <div class="palco"><main id="conteudo"></main></div></div>
-    \${aba==='automacoes'?'<button class="fab" id="fab" title="Nova automa\\u00e7\\u00e3o" aria-label="Nova automa\\u00e7\\u00e3o">+</button>':''}\`;
+    \${aba==='automacoes'?'<button class="fab" id="fab" title="Nova automação" aria-label="Nova automação">+</button>':''}\`;
 
   app.querySelectorAll('nav a').forEach((a) => { a.onclick = () => { aba = a.dataset.aba; desenhar(); }; });
   document.getElementById('sair').onclick = async () => { await sb.auth.signOut(); location.reload(); };
@@ -1178,7 +1179,7 @@ function desenhar(){
 }
 
 function tarja(){
-  return modoTeste ? \`<div class="tarja"><span>Modo de teste ligado. S\\u00f3 as contas testadoras recebem mensagem.</span>
+  return modoTeste ? \`<div class="tarja"><span>Modo de teste ligado. Só as contas testadoras recebem mensagem.</span>
     \${souAdmin() ? '<button class="btn sm" id="desligar">Desligar</button>' : ''}</div>\` : '';
 }
 function ligarTarja(){
@@ -1199,7 +1200,7 @@ let resultados = {};
 
 async function abaAutomacoes(){
   const c = document.getElementById('conteudo');
-  c.innerHTML = tarja() + '<p class="sub">Carregando automa\\u00e7\\u00f5es\\u2026</p>';
+  c.innerHTML = tarja() + '<p class="sub">Carregando automações…</p>';
   ligarTarja();
 
   const [{ data: itens, error }, { data: pastas }, { data: medidas }] = await Promise.all([
@@ -1207,7 +1208,7 @@ async function abaAutomacoes(){
     sb.from('pastas').select('*').order('criado_em'),
     sb.from('desempenho_por_regra').select('*'),
   ]);
-  if (error) { c.innerHTML = tarja() + \`<div class="aviso">N\\u00e3o foi poss\\u00edvel carregar: \${esc(error.message)}</div>\`; return ligarTarja(); }
+  if (error) { c.innerHTML = tarja() + \`<div class="aviso">Não foi possível carregar: \${esc(error.message)}</div>\`; return ligarTarja(); }
 
   resultados = Object.fromEntries((medidas ?? []).map((m) => [m.regra_id, m]));
   const soma = (k) => (medidas ?? []).reduce((t,l) => t + Number(l[k] ?? 0), 0);
@@ -1217,17 +1218,17 @@ async function abaAutomacoes(){
     (situacao === 'todas' || (situacao === 'ativas' ? r.ativa : !r.ativa)));
 
   c.innerHTML = tarja() + \`<div class="topo">
-      <div class="cresce"><h1>Automa\\u00e7\\u00f5es</h1>
-        <p>Respostas autom\\u00e1ticas a quem comenta no Instagram.</p></div>
+      <div class="cresce"><h1>Automações</h1>
+        <p>Respostas automáticas a quem comenta no Instagram.</p></div>
       <button class="btn" id="npasta">Nova pasta</button>
-      <button class="btn pri" id="nova">Criar automa\\u00e7\\u00e3o</button></div>
+      <button class="btn pri" id="nova">Criar automação</button></div>
     <div class="numeros">
-      <div class="numero"><b>\${itens.filter((r)=>r.ativa).length}</b><span>automa\\u00e7\\u00f5es ativas</span></div>
-      <div class="numero"><b>\${num(soma('comentarios'))}</b><span>coment\\u00e1rios recebidos</span></div>
+      <div class="numero"><b>\${itens.filter((r)=>r.ativa).length}</b><span>automações ativas</span></div>
+      <div class="numero"><b>\${num(soma('comentarios'))}</b><span>comentários recebidos</span></div>
       <div class="numero"><b>\${num(soma('dms_enviadas'))}</b><span>conversas iniciadas</span></div>
       <div class="numero"><b>\${num(soma('cliques'))}</b><span>cliques no link</span></div>
     </div>
-    <p class="sub" style="margin:0 0 20px">Desde o in\\u00edcio. O recorte por per\\u00edodo fica em Desempenho.</p>
+    <p class="sub" style="margin:0 0 20px">Desde o início. O recorte por período fica em Desempenho.</p>
     <div id="form"></div>
     \${(pastas ?? []).length ? \`<div class="pastas">
       <button class="chipsel mini" data-pasta="todas" aria-pressed="\${pastaAtual==='todas'}">Todas as pastas</button>
@@ -1241,8 +1242,8 @@ async function abaAutomacoes(){
       <button class="chipsel mini" data-sit="pausadas" aria-pressed="\${situacao==='pausadas'}">Pausadas</button>
     </div>
     \${visiveis.length ? \`<div class="lista">\${visiveis.map(linhaAutomacao).join('')}</div>\`
-      : (itens.length ? '<div class="vazio"><b>Nada neste filtro</b><span>Troque a pasta ou a situa\\u00e7\\u00e3o acima.</span></div>'
-        : '<div class="vazio"><b>Nenhuma automa\\u00e7\\u00e3o ainda</b><span>Crie a primeira para come\\u00e7ar a responder coment\\u00e1rios.</span></div>')}\`;
+      : (itens.length ? '<div class="vazio"><b>Nada neste filtro</b><span>Troque a pasta ou a situação acima.</span></div>'
+        : '<div class="vazio"><b>Nenhuma automação ainda</b><span>Crie a primeira para começar a responder comentários.</span></div>')}\`;
   ligarTarja();
 
   document.getElementById('nova').onclick = () => assistente();
@@ -1277,15 +1278,15 @@ async function abaAutomacoes(){
 }
 
 function alcance(r){
-  if (r.alvo === 'qualquer') return 'Qualquer publica\\u00e7\\u00e3o';
-  if (r.alvo === 'proxima' && !r.media_id) return 'Aguardando a pr\\u00f3xima publica\\u00e7\\u00e3o';
-  return \`<a href="\${esc(r.permalink||'#')}" target="_blank" rel="noopener" style="color:var(--acc-tx)">Publica\\u00e7\\u00e3o espec\\u00edfica</a>\`;
+  if (r.alvo === 'qualquer') return 'Qualquer publicação';
+  if (r.alvo === 'proxima' && !r.media_id) return 'Aguardando a próxima publicação';
+  return \`<a href="\${esc(r.permalink||'#')}" target="_blank" rel="noopener" style="color:var(--acc-tx)">Publicação específica</a>\`;
 }
 
 function capa(r){
   if (r.miniatura_url) return \`<img class="capa" src="\${esc(r.miniatura_url)}" alt="" loading="lazy">\`;
   if (r.alvo === 'qualquer') return '<div class="capa vazia">todas</div>';
-  if (r.alvo === 'proxima') return '<div class="capa vazia">pr\\u00f3xima</div>';
+  if (r.alvo === 'proxima') return '<div class="capa vazia">próxima</div>';
   return '<div class="capa vazia">post</div>';
 }
 
@@ -1293,16 +1294,16 @@ function linhaAutomacao(r){
   const esperando = r.alvo === 'proxima' && !r.media_id;
   const m = resultados[r.id] ?? {};
   const temBotao = (r.rotulo_botao ?? '').trim();
-  const formato = temBotao ? \`bot\\u00e3o \\u201c\${esc(r.rotulo_botao)}\\u201d\` : 'link no texto';
+  const formato = temBotao ? \`botão “\${esc(r.rotulo_botao)}”\` : 'link no texto';
   const placar = esperando
-    ? '<div class="sub">Sem n\\u00fameros ainda. Come\\u00e7a a contar quando a pr\\u00f3xima publica\\u00e7\\u00e3o sair.</div>'
+    ? '<div class="sub">Sem números ainda. Começa a contar quando a próxima publicação sair.</div>'
     : \`<div class="placar">
-        <div><b>\${num(m.comentarios)}</b>coment\\u00e1rios</div>
+        <div><b>\${num(m.comentarios)}</b>comentários</div>
         <div><b>\${num(m.dms_enviadas)}</b>conversas</div>
         \${temBotao
           ? \`<div><b>\${num(m.cliques)}</b>cliques</div>
              <div><b>\${m.taxa_de_clique ?? 0}%</b>por conversa</div>\`
-          : '<div><b class="mudo">\\u2014</b>link no texto n\\u00e3o mede</div>'}
+          : '<div><b class="mudo">—</b>link no texto não mede</div>'}
         \${m.dms_recusadas ? \`<div><b class="ruim">\${num(m.dms_recusadas)}</b>recusaram</div>\` : ''}
         \${m.erros ? \`<div><b class="ruim">\${num(m.erros)}</b>erros</div>\` : ''}
       </div>\`;
@@ -1324,21 +1325,21 @@ async function alternar(r){
   const { error } = await sb.from('regras').update({ ativa: !r.ativa, atualizado_por: sessao.user.id }).eq('id', r.id);
   if (error) return toast(error.message);
   abaAutomacoes();
-  toast(r.ativa ? 'Automa\\u00e7\\u00e3o pausada' : 'Automa\\u00e7\\u00e3o ativada', 'Desfazer', async () => {
+  toast(r.ativa ? 'Automação pausada' : 'Automação ativada', 'Desfazer', async () => {
     await sb.from('regras').update({ ativa: r.ativa }).eq('id', r.id); abaAutomacoes();
   });
 }
 async function duplicar(r){
   const { id, criado_em, atualizado_em, pastas, ...resto } = r;
-  const { error } = await sb.from('regras').insert({ ...resto, nome: r.nome + ' (c\\u00f3pia)', ativa:false,
+  const { error } = await sb.from('regras').insert({ ...resto, nome: r.nome + ' (cópia)', ativa:false,
     codigo_curto: Math.random().toString(36).slice(2,8), criado_por: sessao.user.id });
   if (error) return toast(error.message);
-  abaAutomacoes(); toast('Automa\\u00e7\\u00e3o duplicada, pausada');
+  abaAutomacoes(); toast('Automação duplicada, pausada');
 }
 async function excluir(r){
   const { error } = await sb.from('regras').delete().eq('id', r.id);
-  if (error) return toast('S\\u00f3 administrador pode excluir. Pause no lugar.');
-  abaAutomacoes(); toast('Automa\\u00e7\\u00e3o exclu\\u00edda');
+  if (error) return toast('Só administrador pode excluir. Pause no lugar.');
+  abaAutomacoes(); toast('Automação excluída');
 }
 
 /* ------------------------------------------- assistente em tres etapas */
@@ -1353,7 +1354,7 @@ function assistente(regra){
     permalink: e.permalink ?? null, miniatura_url: e.miniatura_url ?? null, legenda: '',
     palavras: (e.palavras_chave ?? []).join(', '), link: e.link ?? '',
     rotulo_botao: e.rotulo_botao ?? '',
-    mensagem: e.mensagem_dm ?? 'Oi! Que bom ter voc\\u00ea por aqui.\\n\\nAqui est\\u00e1 o que voc\\u00ea pediu: [link]',
+    mensagem: e.mensagem_dm ?? 'Oi! Que bom ter você por aqui.\\n\\nAqui está o que você pediu: [link]',
     publica: e.resposta_publica ?? '', recusa: e.resposta_publica_recusa ?? '',
   };
   etapa = 1;
@@ -1361,7 +1362,7 @@ function assistente(regra){
 }
 
 function trilha(){
-  const nomes = ['Gatilho','Mensagem','Confirma\\u00e7\\u00e3o'];
+  const nomes = ['Gatilho','Mensagem','Confirmação'];
   return \`<ol class="passos">\${nomes.map((n,i) => {
     const k = i + 1;
     const classe = k === etapa ? 'aqui' : (k < etapa ? 'feito' : '');
@@ -1376,8 +1377,8 @@ function trilha(){
 function desenharEtapa(){
   const c = document.getElementById('conteudo');
   c.innerHTML = \`<div class="topo"><div class="cresce">
-      <p style="margin:0;font-size:12px;color:var(--tx3)">Automa\\u00e7\\u00f5es</p>
-      <h1>\${rascunho.id ? 'Editar automa\\u00e7\\u00e3o' : 'Nova automa\\u00e7\\u00e3o'}</h1></div>
+      <p style="margin:0;font-size:12px;color:var(--tx3)">Automações</p>
+      <h1>\${rascunho.id ? 'Editar automação' : 'Nova automação'}</h1></div>
       <button class="btn ghost" id="xis">Cancelar</button></div>
     \${trilha()}<div id="etapa"></div>\`;
   document.getElementById('xis').onclick = () => abaAutomacoes();
@@ -1388,16 +1389,16 @@ async function etapaGatilho(){
   const d = document.getElementById('etapa');
   const { data: pastas } = await sb.from('pastas').select('*').order('criado_em');
   const opcoes = [
-    ['publicacao','Uma publica\\u00e7\\u00e3o','A mais usada. Vale para um post ou reel espec\\u00edfico.'],
-    ['proxima','A pr\\u00f3xima que eu publicar','Fica aguardando e se prende ao pr\\u00f3ximo post que sair.'],
-    ['qualquer','Qualquer publica\\u00e7\\u00e3o','Rede de seguran\\u00e7a, s\\u00f3 onde n\\u00e3o houver automa\\u00e7\\u00e3o pr\\u00f3pria.'],
+    ['publicacao','Uma publicação','A mais usada. Vale para um post ou reel específico.'],
+    ['proxima','A próxima que eu publicar','Fica aguardando e se prende ao próximo post que sair.'],
+    ['qualquer','Qualquer publicação','Rede de segurança, só onde não houver automação própria.'],
   ];
 
   d.innerHTML = \`<h2>Onde e quando responder?</h2>
-    <p class="sub" style="margin-bottom:24px">Escolha a publica\\u00e7\\u00e3o que vai receber os coment\\u00e1rios e as palavras que acionam a resposta.</p>
+    <p class="sub" style="margin-bottom:24px">Escolha a publicação que vai receber os comentários e as palavras que acionam a resposta.</p>
     <div class="campo"><label for="nome">Nome</label><div>
-      <input id="nome" value="\${esc(rascunho.nome)}" placeholder="Edital de educa\\u00e7\\u00e3o patrimonial">
-      <span class="dica">\\u00c9 assim que a equipe encontra a automa\\u00e7\\u00e3o depois.</span></div></div>
+      <input id="nome" value="\${esc(rascunho.nome)}" placeholder="Edital de educação patrimonial">
+      <span class="dica">É assim que a equipe encontra a automação depois.</span></div></div>
     \${(pastas ?? []).length ? \`<div class="campo"><label for="pasta">Pasta</label><div><select id="pasta">
       <option value="">Sem pasta</option>
       \${pastas.map((p)=>\`<option value="\${p.id}" \${p.id===rascunho.pasta_id?'selected':''}>\${esc(p.nome)}</option>\`).join('')}
@@ -1410,13 +1411,13 @@ async function etapaGatilho(){
           <span style="font-weight:600">\${t}</span></span>
         <span style="display:block;font-size:13px;color:var(--tx2);margin:8px 0 0 28px">\${s}</span></label>\`).join('')}
       </div></div></div>
-    <div class="campo" id="caixaposts"><label>Publica\\u00e7\\u00e3o</label><div>
+    <div class="campo" id="caixaposts"><label>Publicação</label><div>
       <div class="posts" id="posts"></div></div></div>
     <div class="campo"><label for="chaves">Palavras</label><div>
       <input id="chaves" value="\${esc(rascunho.palavras)}" placeholder="edital, quero o edital">
       <div id="lidas" style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap"></div>
       <div id="conflito"></div>
-      <span class="dica">Separe por v\\u00edrgula. N\\u00e3o diferencia mai\\u00fasculas nem acentos; basta a palavra aparecer no coment\\u00e1rio.</span></div></div>
+      <span class="dica">Separe por vírgula. Não diferencia maiúsculas nem acentos; basta a palavra aparecer no comentário.</span></div></div>
     <div style="display:flex;gap:12px;align-items:center;border-top:1px solid var(--ln);padding-top:20px;flex-wrap:wrap">
       <span class="sub" style="flex:1;margin:0">Etapa 1 de 3</span>
       <button class="btn pri" id="adiante">Continuar</button></div>\`;
@@ -1439,7 +1440,7 @@ async function etapaGatilho(){
     espera = setTimeout(async () => {
       const { data } = await sb.rpc('conflitos_de_regra', { p_id: rascunho.id, p_alvo: rascunho.alvo,
         p_media_id: rascunho.media_id, p_palavras: chaves() });
-      if (data?.length) cx.innerHTML = \`<div class="aviso atencao">A palavra <b>\${esc(data[0].palavra)}</b> j\\u00e1 \\u00e9 usada por <b>\${esc(data[0].nome)}</b> no mesmo alcance. S\\u00f3 uma das duas vai responder.</div>\`;
+      if (data?.length) cx.innerHTML = \`<div class="aviso atencao">A palavra <b>\${esc(data[0].palavra)}</b> já é usada por <b>\${esc(data[0].nome)}</b> no mesmo alcance. Só uma das duas vai responder.</div>\`;
     }, 400);
   };
   document.getElementById('chaves').oninput = checar;
@@ -1449,8 +1450,8 @@ async function etapaGatilho(){
     rascunho.nome = document.getElementById('nome').value.trim();
     rascunho.pasta_id = document.getElementById('pasta')?.value || '';
     rascunho.palavras = document.getElementById('chaves').value;
-    if (!rascunho.nome) return toast('D\\u00ea um nome \\u00e0 automa\\u00e7\\u00e3o');
-    if (rascunho.alvo === 'publicacao' && !rascunho.media_id) return toast('Escolha a publica\\u00e7\\u00e3o ou troque o alcance');
+    if (!rascunho.nome) return toast('Dê um nome à automação');
+    if (rascunho.alvo === 'publicacao' && !rascunho.media_id) return toast('Escolha a publicação ou troque o alcance');
     if (!chaves().length) return toast('Informe pelo menos uma palavra');
     etapa = 2; desenharEtapa();
   };
@@ -1458,11 +1459,11 @@ async function etapaGatilho(){
 
 async function carregarPosts(){
   const grade = document.getElementById('posts');
-  grade.innerHTML = '<p class="sub">Buscando publica\\u00e7\\u00f5es\\u2026</p>';
+  grade.innerHTML = '<p class="sub">Buscando publicações…</p>';
   if (!publicacoesCache) {
     try { publicacoesCache = await api('/api/publicacoes'); }
     catch (err) {
-      grade.innerHTML = \`<div class="aviso">N\\u00e3o foi poss\\u00edvel buscar as publica\\u00e7\\u00f5es.<small>\${esc(String(err.message))}</small></div>\`;
+      grade.innerHTML = \`<div class="aviso">Não foi possível buscar as publicações.<small>\${esc(String(err.message))}</small></div>\`;
       return;
     }
   }
@@ -1489,22 +1490,22 @@ function etapaMensagem(){
   d.innerHTML = \`<div style="display:grid;grid-template-columns:minmax(340px,1fr) 300px;gap:36px;align-items:start" id="duas">
     <div>
       <h2>O que a pessoa recebe</h2>
-      <p class="sub" style="margin-bottom:24px">A mensagem chega no direct poucos segundos depois do coment\\u00e1rio.</p>
+      <p class="sub" style="margin-bottom:24px">A mensagem chega no direct poucos segundos depois do comentário.</p>
       <div class="campo"><label for="link">Link</label><div>
         <input id="link" type="url" inputmode="url" value="\${esc(rascunho.link)}" placeholder="https://caurs.gov.br/..."></div></div>
-      <div class="campo"><label for="rotulo">Texto do bot\\u00e3o</label><div>
-        <input id="rotulo" maxlength="20" value="\${esc(rascunho.rotulo_botao)}" placeholder="Ler a mat\\u00e9ria">
+      <div class="campo"><label for="rotulo">Texto do botão</label><div>
+        <input id="rotulo" maxlength="20" value="\${esc(rascunho.rotulo_botao)}" placeholder="Ler a matéria">
         <div id="expbotao" class="dica"></div></div></div>
       <div class="campo"><label for="msg">Mensagem</label><div>
         <textarea id="msg" rows="5">\${esc(rascunho.mensagem)}</textarea>
         <span class="dica"><span class="contador" id="contador"></span><span id="dicamsg"></span></span>
-        <div class="aviso info" style="margin:12px 0 0;font-size:13px">O Instagram entrega a mensagem como <b>texto puro</b>. N\\u00e3o h\\u00e1 negrito, it\\u00e1lico nem tachado na API, e um marcador digitado chegaria literal. Quebra de linha, par\\u00e1grafo e emoji funcionam normalmente.</div>
+        <div class="aviso info" style="margin:12px 0 0;font-size:13px">O Instagram entrega a mensagem como <b>texto puro</b>. Não há negrito, itálico nem tachado na API, e um marcador digitado chegaria literal. Quebra de linha, parágrafo e emoji funcionam normalmente.</div>
       </div></div>
       <div class="campo"><label for="pub">No post</label><div>
         <input id="pub" value="\${esc(rascunho.publica)}" placeholder="Te enviamos no direct!">
-        <span class="dica">Opcional. Vira coment\\u00e1rio p\\u00fablico quando a mensagem \\u00e9 entregue.</span></div></div>
+        <span class="dica">Opcional. Vira comentário público quando a mensagem é entregue.</span></div></div>
       <div class="campo"><label for="rec">Se recusarem</label><div>
-        <input id="rec" value="\${esc(rascunho.recusa)}" placeholder="O link est\\u00e1 na bio.">
+        <input id="rec" value="\${esc(rascunho.recusa)}" placeholder="O link está na bio.">
         <span class="dica">Opcional. Para quem bloqueia mensagens de perfis comerciais.</span></div></div>
       <div style="display:flex;gap:12px;align-items:center;border-top:1px solid var(--ln);padding-top:20px;flex-wrap:wrap">
         <button class="btn" id="voltar">Voltar</button>
@@ -1512,7 +1513,7 @@ function etapaMensagem(){
         <button class="btn pri" id="adiante">Continuar</button></div>
     </div>
     <aside>
-      <h3 style="font-size:13px;color:var(--tx2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px">Pr\\u00e9via</h3>
+      <h3 style="font-size:13px;color:var(--tx2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px">Prévia</h3>
       <div id="previa"></div>
     </aside></div>\`;
 
@@ -1522,13 +1523,13 @@ function etapaMensagem(){
     const rotulo = document.getElementById('rotulo').value.trim();
     const link = document.getElementById('link').value;
     document.getElementById('expbotao').innerHTML = rotulo
-      ? 'A mensagem vai com bot\\u00e3o e nenhum endere\\u00e7o aparece. Os cliques s\\u00e3o contados. <b>O bot\\u00e3o n\\u00e3o aparece para quem l\\u00ea o direct pelo navegador do computador.</b>'
-      : 'Vazio, a mensagem vai como texto com o endere\\u00e7o inteiro \\u00e0 mostra, e os cliques n\\u00e3o s\\u00e3o contados.';
+      ? 'A mensagem vai com botão e nenhum endereço aparece. Os cliques são contados. <b>O botão não aparece para quem lê o direct pelo navegador do computador.</b>'
+      : 'Vazio, a mensagem vai como texto com o endereço inteiro à mostra, e os cliques não são contados.';
     document.getElementById('dicamsg').textContent = rotulo
-      ? 'No modo bot\\u00e3o o [link] sai do texto, porque o endere\\u00e7o vive no bot\\u00e3o.'
-      : 'Use [link] onde o endere\\u00e7o deve entrar.';
+      ? 'No modo botão o [link] sai do texto, porque o endereço vive no botão.'
+      : 'Use [link] onde o endereço deve entrar.';
 
-    const texto = textoDaMensagem(document.getElementById('msg').value, rotulo, link || 'https://\\u2026');
+    const texto = textoDaMensagem(document.getElementById('msg').value, rotulo, link || 'https://…');
     const n = bytes(texto);
     const cont = document.getElementById('contador');
     cont.textContent = \`\${n} de \${LIMITE_DM} bytes\`;
@@ -1554,7 +1555,7 @@ function etapaMensagem(){
     guardar();
     if (!rascunho.link) return toast('Informe o link que a pessoa vai receber');
     const n = bytes(textoDaMensagem(rascunho.mensagem, rascunho.rotulo_botao, rascunho.link));
-    if (n > LIMITE_DM) return toast(\`A mensagem tem \${n} bytes; o limite da Meta \\u00e9 \${LIMITE_DM}\`);
+    if (n > LIMITE_DM) return toast(\`A mensagem tem \${n} bytes; o limite da Meta é \${LIMITE_DM}\`);
     etapa = 3; desenharEtapa();
   };
 }
@@ -1562,19 +1563,19 @@ function etapaMensagem(){
 function etapaConfirmar(){
   const d = document.getElementById('etapa');
   const chaves = rascunho.palavras.split(',').map((s)=>s.trim()).filter(Boolean);
-  const onde = rascunho.alvo === 'qualquer' ? 'em <mark>qualquer publica\\u00e7\\u00e3o</mark>'
-    : rascunho.alvo === 'proxima' ? 'na <mark>pr\\u00f3xima publica\\u00e7\\u00e3o</mark> que sair'
-    : \`na publica\\u00e7\\u00e3o <a href="\${esc(rascunho.permalink||'#')}" target="_blank" rel="noopener">\${esc(rascunho.legenda || 'escolhida')}</a>\`;
+  const onde = rascunho.alvo === 'qualquer' ? 'em <mark>qualquer publicação</mark>'
+    : rascunho.alvo === 'proxima' ? 'na <mark>próxima publicação</mark> que sair'
+    : \`na publicação <a href="\${esc(rascunho.permalink||'#')}" target="_blank" rel="noopener">\${esc(rascunho.legenda || 'escolhida')}</a>\`;
   const entrega = rascunho.rotulo_botao
-    ? \`enviar uma mensagem no direct com o bot\\u00e3o <mark>\${esc(rascunho.rotulo_botao)}</mark>\`
+    ? \`enviar uma mensagem no direct com o botão <mark>\${esc(rascunho.rotulo_botao)}</mark>\`
     : 'enviar uma mensagem no direct com o link no texto';
 
   d.innerHTML = \`<h2>Confira antes de ativar</h2>
-    <p class="sub" style="margin-bottom:24px">Leia como se fosse uma frase. Se fizer sentido, est\\u00e1 pronta.</p>
-    <div class="frase">Quando algu\\u00e9m comentar
+    <p class="sub" style="margin-bottom:24px">Leia como se fosse uma frase. Se fizer sentido, está pronta.</p>
+    <div class="frase">Quando alguém comentar
       \${chaves.map((p)=>\`<mark>\${esc(p)}</mark>\`).join(' ou ')}
-      \${onde}, \${entrega}\${rascunho.publica ? \` e responder no post <b>\\u201c\${esc(rascunho.publica)}\\u201d</b>\` : ''}.</div>
-    \${modoTeste ? '<div class="aviso atencao">O <b>modo de teste est\\u00e1 ligado</b>. S\\u00f3 as contas testadoras recebem a mensagem; quem comentar fora da lista fica registrado e n\\u00e3o recebe nada.</div>' : ''}
+      \${onde}, \${entrega}\${rascunho.publica ? \` e responder no post <b>“\${esc(rascunho.publica)}”</b>\` : ''}.</div>
+    \${modoTeste ? '<div class="aviso atencao">O <b>modo de teste está ligado</b>. Só as contas testadoras recebem a mensagem; quem comentar fora da lista fica registrado e não recebe nada.</div>' : ''}
     <div style="display:flex;gap:12px;align-items:center;border-top:1px solid var(--ln);padding-top:20px;flex-wrap:wrap;margin-top:22px">
       <button class="btn" id="voltar">Voltar</button>
       <span style="flex:1"></span>
@@ -1605,7 +1606,7 @@ async function salvar(ativa){
     : await sb.from('regras').insert({ ...dados, codigo_curto: Math.random().toString(36).slice(2,8), criado_por: sessao.user.id });
   if (error) return toast(error.message.replace(/^.*P0001:\\s*/, ''));
   abaAutomacoes();
-  toast(ativa ? 'Automa\\u00e7\\u00e3o ativa' : 'Salva, pausada');
+  toast(ativa ? 'Automação ativa' : 'Salva, pausada');
 }
 
 /* ------------------------------------------------------ nuvem de palavras */
@@ -1646,7 +1647,7 @@ function desenharNuvem(el, itens){
     + postas.map((p) => \`<text x="\${p.cx.toFixed(1)}" y="\${p.cy.toFixed(1)}" text-anchor="middle"
         dominant-baseline="central" font-size="\${p.corpo}" font-weight="700" fill="\${p.cor}"
         \${p.girada ? \`transform="rotate(-90 \${p.cx.toFixed(1)} \${p.cy.toFixed(1)})"\` : ''}>
-        <title>\${esc(p.palavra)} \\u2014 \${p.n} coment\\u00e1rios</title>\${esc(p.palavra)}</text>\`).join('')
+        <title>\${esc(p.palavra)} — \${p.n} comentários</title>\${esc(p.palavra)}</text>\`).join('')
     + '</svg>';
 }
 
@@ -1660,31 +1661,31 @@ function desenharNuvem(el, itens){
 const NOMEF = { CAROUSEL_ALBUM:'Carrossel', IMAGE:'Feed', VIDEO:'Reels' };
 const COLUNAS = {
   data:              { nome:'Data', n:false, v:(p) => new Date(p.publicado_em).toLocaleDateString('pt-BR',{day:'2-digit',month:'short'}),
-                       ajuda:'Dia em que a publica\\u00e7\\u00e3o foi ao ar.' },
+                       ajuda:'Dia em que a publicação foi ao ar.' },
   formato:           { nome:'Formato', n:false, v:(p) => NOMEF[p.formato] ?? (p.formato ?? ''),
-                       ajuda:'Como a Meta classifica a m\\u00eddia: Feed (imagem \\u00fanica), Carrossel (v\\u00e1rias) ou Reels (v\\u00eddeo).' },
+                       ajuda:'Como a Meta classifica a mídia: Feed (imagem única), Carrossel (várias) ou Reels (vídeo).' },
   alcance:           { nome:'Alcance', n:true,
-                       ajuda:'Contas \\u00fanicas que viram a publica\\u00e7\\u00e3o. Quem volta a ver conta uma vez s\\u00f3.' },
-  visualizacoes:     { nome:'Visualiza\\u00e7\\u00f5es', n:true,
-                       ajuda:'Quantas vezes a publica\\u00e7\\u00e3o foi exibida, somando as repeti\\u00e7\\u00f5es da mesma pessoa. \\u00c9 sempre maior ou igual ao alcance.' },
-  interacoes:        { nome:'Intera\\u00e7\\u00f5es', n:true,
-                       ajuda:'Soma de curtidas, coment\\u00e1rios, salvamentos e compartilhamentos.' },
+                       ajuda:'Contas únicas que viram a publicação. Quem volta a ver conta uma vez só.' },
+  visualizacoes:     { nome:'Visualizações', n:true,
+                       ajuda:'Quantas vezes a publicação foi exibida, somando as repetições da mesma pessoa. É sempre maior ou igual ao alcance.' },
+  interacoes:        { nome:'Interações', n:true,
+                       ajuda:'Soma de curtidas, comentários, salvamentos e compartilhamentos.' },
   taxa_interacao:    { nome:'Por alcance', n:true, pct:true,
-                       ajuda:'Intera\\u00e7\\u00f5es dividido por alcance, vezes 100. Quanto de quem viu reagiu de alguma forma. Normaliza post grande e pequeno.' },
+                       ajuda:'Interações dividido por alcance, vezes 100. Quanto de quem viu reagiu de alguma forma. Normaliza post grande e pequeno.' },
   curtidas:          { nome:'Curtidas', n:true,
-                       ajuda:'Cora\\u00e7\\u00f5es na publica\\u00e7\\u00e3o. O sinal mais barato: custa um toque.' },
-  comentarios:       { nome:'Coment\\u00e1rios', n:true,
-                       ajuda:'Coment\\u00e1rios recebidos, incluindo os que n\\u00e3o acionam automa\\u00e7\\u00e3o.' },
+                       ajuda:'Corações na publicação. O sinal mais barato: custa um toque.' },
+  comentarios:       { nome:'Comentários', n:true,
+                       ajuda:'Comentários recebidos, incluindo os que não acionam automação.' },
   salvamentos:       { nome:'Salvos', n:true,
-                       ajuda:'Quem guardou para ver depois. Sinal de conte\\u00fado \\u00fatil, n\\u00e3o s\\u00f3 agrad\\u00e1vel.' },
+                       ajuda:'Quem guardou para ver depois. Sinal de conteúdo útil, não só agradável.' },
   compartilhamentos: { nome:'Compartilhados', n:true,
-                       ajuda:'Quem repassou no direct ou nos stories. \\u00c9 o que leva a publica\\u00e7\\u00e3o para fora de quem j\\u00e1 segue.' },
+                       ajuda:'Quem repassou no direct ou nos stories. É o que leva a publicação para fora de quem já segue.' },
   intencao:          { nome:'Salvos+comp.', n:true,
-                       ajuda:'Salvamentos mais compartilhamentos. Os dois gestos que exigem decis\\u00e3o, por isso dizem mais que a curtida.' },
+                       ajuda:'Salvamentos mais compartilhamentos. Os dois gestos que exigem decisão, por isso dizem mais que a curtida.' },
   dms_enviadas:      { nome:'Conversas', n:true,
-                       ajuda:'Mensagens entregues no direct pela automa\\u00e7\\u00e3o desta publica\\u00e7\\u00e3o.' },
+                       ajuda:'Mensagens entregues no direct pela automação desta publicação.' },
   cliques:           { nome:'Cliques', n:true,
-                       ajuda:'Aberturas do link curto, j\\u00e1 descontados rastreadores e repeti\\u00e7\\u00f5es da mesma origem em 90 segundos. S\\u00f3 existe no modo bot\\u00e3o.' },
+                       ajuda:'Aberturas do link curto, já descontados rastreadores e repetições da mesma origem em 90 segundos. Só existe no modo botão.' },
 };
 const PADRAO = ['data','formato','alcance','visualizacoes','interacoes','taxa_interacao'];
 
@@ -1707,13 +1708,13 @@ const celula = (p, k) => {
   const c = COLUNAS[k];
   if (!c.n) return c.v(p);
   const bruto = p[k];
-  if (bruto == null) return '\\u2014';
+  if (bruto == null) return '—';
   return c.pct ? bruto + '%' : num(bruto);
 };
 
 async function abaDesempenho(){
   const c = document.getElementById('conteudo');
-  c.innerHTML = tarja() + '<p class="sub">Somando n\\u00fameros\\u2026</p>';
+  c.innerHTML = tarja() + '<p class="sub">Somando números…</p>';
   const desde = new Date(Date.now() - periodo * 86400000).toISOString().slice(0,10);
 
   const [{ data: posts }, { data: palavras }, { data: regras }] = await Promise.all([
@@ -1744,30 +1745,30 @@ async function abaDesempenho(){
   }).filter((x) => x.n);
 
   c.innerHTML = tarja() + \`<div class="topo"><div class="cresce"><h1>Desempenho</h1>
-      <p>O que o perfil publicou no per\\u00edodo e o que funcionou, para orientar o que vem depois.</p></div>
+      <p>O que o perfil publicou no período e o que funcionou, para orientar o que vem depois.</p></div>
       <button class="btn" id="csv">Baixar planilha</button></div>
     <div class="pastas">
-      <span class="sub" style="margin:0;font-weight:600">Per\\u00edodo</span>
+      <span class="sub" style="margin:0;font-weight:600">Período</span>
       <button class="chipsel mini" data-per="30" aria-pressed="\${periodo===30}">30 dias</button>
       <button class="chipsel mini" data-per="90" aria-pressed="\${periodo===90}">90 dias</button>
       <button class="chipsel mini" data-per="365" aria-pressed="\${periodo===365}">Este ano</button>
     </div>
     <div class="numeros">
-      <div class="numero"><b class="grande">\${num(alcanceTotal)}</b><span>contas alcan\\u00e7adas</span></div>
-      <div class="numero"><b>\${num(interacoes)}</b><span>intera\\u00e7\\u00f5es</span>
-        \${alcanceTotal ? \`<em>\${(100*interacoes/alcanceTotal).toFixed(1)}% de quem foi alcan\\u00e7ado</em>\` : ''}</div>
+      <div class="numero"><b class="grande">\${num(alcanceTotal)}</b><span>contas alcançadas</span></div>
+      <div class="numero"><b>\${num(interacoes)}</b><span>interações</span>
+        \${alcanceTotal ? \`<em>\${(100*interacoes/alcanceTotal).toFixed(1)}% de quem foi alcançado</em>\` : ''}</div>
       <div class="numero"><b>\${num(somaR('dms_enviadas'))}</b><span>conversas iniciadas</span>
         <em style="color:var(--tx2);font-weight:400">\${num(somaR('cliques'))} abriram o link</em></div>
-      <div class="numero"><b>\${num(todos.length)}</b><span>publica\\u00e7\\u00f5es</span></div>
+      <div class="numero"><b>\${num(todos.length)}</b><span>publicações</span></div>
     </div>
-    \${todos.length ? '' : '<div class="aviso info">Nenhuma publica\\u00e7\\u00e3o com m\\u00e9tricas no per\\u00edodo. Em Ajustes, rode <b>Ler m\\u00e9tricas</b> at\\u00e9 a fila esvaziar.</div>'}
+    \${todos.length ? '' : '<div class="aviso info">Nenhuma publicação com métricas no período. Em Ajustes, rode <b>Ler métricas</b> até a fila esvaziar.</div>'}
 
-    <h2 style="margin:28px 0 12px">Publica\\u00e7\\u00f5es</h2>
+    <h2 style="margin:28px 0 12px">Publicações</h2>
     <div class="barra">
       <h3>Colunas da tabela</h3>
       <div class="pastas">\${Object.entries(COLUNAS).map(([k,v]) =>
         \`<button class="chipsel mini" data-col="\${k}" aria-pressed="\${colunas.includes(k)}" title="\${esc(v.ajuda)}">\${v.nome}</button>\`).join('')}
-        <button class="btn sm" id="colpadrao" style="margin-left:auto">Voltar ao padr\\u00e3o</button></div>
+        <button class="btn sm" id="colpadrao" style="margin-left:auto">Voltar ao padrão</button></div>
     </div>
     <div class="pastas">
       <label class="sub" style="margin:0" for="fmt">Formato</label>
@@ -1778,13 +1779,13 @@ async function abaDesempenho(){
         <option value="CAROUSEL_ALBUM" \${soFormato==='CAROUSEL_ALBUM'?'selected':''}>Carrossel</option>
       </select>
       <label class="sub" style="margin:0;display:flex;align-items:center;gap:8px;cursor:pointer;min-height:44px">
-        <input type="checkbox" id="soauto" \${soAutomacao?'checked':''} style="width:17px;height:17px;accent-color:var(--mag)"> S\\u00f3 com automa\\u00e7\\u00e3o</label>
-      <span class="sub" style="margin:0;margin-left:auto">\${ordenados.length} publica\\u00e7\\u00f5es</span>
+        <input type="checkbox" id="soauto" \${soAutomacao?'checked':''} style="width:17px;height:17px;accent-color:var(--mag)"> Só com automação</label>
+      <span class="sub" style="margin:0;margin-left:auto">\${ordenados.length} publicações</span>
     </div>
     \${ordenados.length ? \`<div class="lista rolavel"><table>
-      <thead><tr><th>Publica\\u00e7\\u00e3o</th>
+      <thead><tr><th>Publicação</th>
         \${colunas.map((k) => \`<th class="\${COLUNAS[k].n?'n ':''}ordenavel" data-ord="\${k}"
-          \${ordem===k?'aria-sort="descending"':''}><span class="marcaajuda" title="\${esc(COLUNAS[k].ajuda)}">\${COLUNAS[k].nome}</span>\${ordem===k?' \\u2193':''}</th>\`).join('')}
+          \${ordem===k?'aria-sort="descending"':''}><span class="marcaajuda" title="\${esc(COLUNAS[k].ajuda)}">\${COLUNAS[k].nome}</span>\${ordem===k?' ↓':''}</th>\`).join('')}
       </tr></thead>
       <tbody>\${ordenados.slice(0,80).map((p) => \`<tr>
         <td class="titulo"><div style="display:flex;gap:10px;align-items:center">
@@ -1795,30 +1796,30 @@ async function abaDesempenho(){
       </tr>\`).join('')}</tbody></table></div>
       <details class="glossario"><summary>O que significa cada coluna</summary>
         <dl>\${colunas.map((k) => \`<div><dt>\${COLUNAS[k].nome}</dt><dd>\${COLUNAS[k].ajuda}</dd></div>\`).join('')}</dl>
-        <p class="sub">Os n\\u00fameros vindos da Meta podem levar at\\u00e9 48 horas para consolidar, ent\\u00e3o os \\u00faltimos dias s\\u00e3o provis\\u00f3rios.</p></details>
-      <p class="sub" style="margin-top:12px">Ordenado por <b>\${COLUNAS[ordem].nome}</b>; clique num cabe\\u00e7alho para trocar. Publica\\u00e7\\u00f5es com alcance abaixo de 300 ficam fora, para uma taxa alta sobre pouca gente n\\u00e3o liderar a lista. Mostrando at\\u00e9 80; a planilha traz todas.</p>\`
-      : '<div class="vazio"><b>Nada neste recorte</b><span>Troque o per\\u00edodo, o formato ou rode a sincroniza\\u00e7\\u00e3o em Ajustes.</span></div>'}
+        <p class="sub">Os números vindos da Meta podem levar até 48 horas para consolidar, então os últimos dias são provisórios.</p></details>
+      <p class="sub" style="margin-top:12px">Ordenado por <b>\${COLUNAS[ordem].nome}</b>; clique num cabeçalho para trocar. Publicações com alcance abaixo de 300 ficam fora, para uma taxa alta sobre pouca gente não liderar a lista. Mostrando até 80; a planilha traz todas.</p>\`
+      : '<div class="vazio"><b>Nada neste recorte</b><span>Troque o período, o formato ou rode a sincronização em Ajustes.</span></div>'}
 
-    \${porFormato.length ? \`<h2 style="margin:28px 0 6px">Qual formato est\\u00e1 rendendo</h2>
-    <p class="sub" style="margin:0 0 12px">Mediana, n\\u00e3o m\\u00e9dia, para um post fora da curva n\\u00e3o distorcer a leitura.</p>
+    \${porFormato.length ? \`<h2 style="margin:28px 0 6px">Qual formato está rendendo</h2>
+    <p class="sub" style="margin:0 0 12px">Mediana, não média, para um post fora da curva não distorcer a leitura.</p>
     <div class="numeros">\${porFormato.map((x) => \`<div class="numero">
-      <span style="font-weight:600;color:var(--tx)">\${NOMEF[x.f]}</span> <span>\\u00b7 \${x.n} posts</span>
-      <b style="font-size:22px;margin-top:8px">\${x.taxa ?? 0}%</b><span>intera\\u00e7\\u00f5es por alcance</span>
+      <span style="font-weight:600;color:var(--tx)">\${NOMEF[x.f]}</span> <span>· \${x.n} posts</span>
+      <b style="font-size:22px;margin-top:8px">\${x.taxa ?? 0}%</b><span>interações por alcance</span>
       <em style="color:var(--tx2);font-weight:400">alcance mediano \${num(x.alcance)}</em></div>\`).join('')}</div>\` : ''}
 
     <h2 style="margin:28px 0 12px">O que as pessoas comentam</h2>
     <div class="cartao">\${nuvem.length ? '<div class="nuvem" id="nuvem"></div>'
-      : '<p class="sub">Nenhuma palavra contabilizada no per\\u00edodo. Em Ajustes, rode <b>Somar palavras</b>.</p>'}
-      <p class="sub" style="margin-top:14px">Contagem agregada, com o n\\u00famero ao passar o mouse. O sistema n\\u00e3o guarda o texto nem o autor dos coment\\u00e1rios que n\\u00e3o acionam uma automa\\u00e7\\u00e3o.</p></div>
+      : '<p class="sub">Nenhuma palavra contabilizada no período. Em Ajustes, rode <b>Somar palavras</b>.</p>'}
+      <p class="sub" style="margin-top:14px">Contagem agregada, com o número ao passar o mouse. O sistema não guarda o texto nem o autor dos comentários que não acionam uma automação.</p></div>
 
-    <h2 style="margin:28px 0 12px">Por automa\\u00e7\\u00e3o</h2>
+    <h2 style="margin:28px 0 12px">Por automação</h2>
     \${(regras ?? []).length ? \`<div class="lista rolavel"><table>
-      <thead><tr><th>Automa\\u00e7\\u00e3o</th><th class="n">Coment\\u00e1rios</th><th class="n">Conversas</th>
+      <thead><tr><th>Automação</th><th class="n">Comentários</th><th class="n">Conversas</th>
       <th class="n">Recusadas</th><th class="n">Cliques</th><th class="n">Por conversa</th></tr></thead>
       <tbody>\${regras.map((l) => \`<tr><td class="titulo">\${esc(l.nome)}</td><td class="n">\${num(l.comentarios)}</td>
         <td class="n">\${num(l.dms_enviadas)}</td><td class="n">\${num(l.dms_recusadas)}</td>
         <td class="n">\${num(l.cliques)}</td><td class="n">\${l.taxa_de_clique}%</td></tr>\`).join('')}</tbody></table></div>\`
-      : '<div class="vazio"><b>Ainda n\\u00e3o h\\u00e1 envios para medir</b><span>Os n\\u00fameros aparecem depois da primeira mensagem.</span></div>'}\`;
+      : '<div class="vazio"><b>Ainda não há envios para medir</b><span>Os números aparecem depois da primeira mensagem.</span></div>'}\`;
   ligarTarja();
 
   c.querySelectorAll('[data-per]').forEach((b) => { b.onclick = () => { periodo = Number(b.dataset.per); abaDesempenho(); }; });
@@ -1856,7 +1857,7 @@ async function abaDesempenho(){
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob(['\\ufeff' + tudo], { type:'text/csv;charset=utf-8' }));
     a.download = \`desempenho-caurs-\${periodo}d.csv\`; a.click();
-    toast(\`Planilha com \${linhas.length} publica\\u00e7\\u00f5es\`);
+    toast(\`Planilha com \${linhas.length} publicações\`);
   };
 }
 
@@ -1864,17 +1865,17 @@ async function abaDesempenho(){
 
 async function abaUsuarios(){
   const c = document.getElementById('conteudo');
-  c.innerHTML = '<p class="sub">Carregando\\u2026</p>';
+  c.innerHTML = '<p class="sub">Carregando…</p>';
   let pessoas = [];
   try { pessoas = await api('/api/usuarios'); }
   catch (err) { c.innerHTML = \`<div class="aviso">\${esc(err.message)}</div>\`; return; }
 
-  c.innerHTML = \`<div class="topo"><div class="cresce"><h1>Usu\\u00e1rios</h1>
+  c.innerHTML = \`<div class="topo"><div class="cresce"><h1>Usuários</h1>
       <p>Quem entra no painel e o que cada pessoa pode fazer.</p></div>
       \${souAdmin() ? '<button class="btn pri" id="nova">Adicionar pessoa</button>' : ''}</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px;margin-bottom:24px">
-      <div class="cartao"><h3>Administrador</h3><p class="sub">Faz tudo o que o editor faz, e mais: excluir automa\\u00e7\\u00e3o, mexer em ajustes, ligar e desligar o modo de teste, e gerir pessoas.</p></div>
-      <div class="cartao"><h3>Editor</h3><p class="sub">Cria, edita, duplica e pausa automa\\u00e7\\u00f5es. V\\u00ea o desempenho. N\\u00e3o exclui nem altera configura\\u00e7\\u00e3o do sistema.</p></div>
+      <div class="cartao"><h3>Administrador</h3><p class="sub">Faz tudo o que o editor faz, e mais: excluir automação, mexer em ajustes, ligar e desligar o modo de teste, e gerir pessoas.</p></div>
+      <div class="cartao"><h3>Editor</h3><p class="sub">Cria, edita, duplica e pausa automações. Vê o desempenho. Não exclui nem altera configuração do sistema.</p></div>
     </div>
     <div id="formpessoa"></div>
     <div class="lista">\${pessoas.map((p) => \`<div class="linha" data-pid="\${p.id}">
@@ -1882,14 +1883,14 @@ async function abaUsuarios(){
       <div class="cresce">
         <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap">
           <h3 data-nome>\${esc(p.nome)}</h3>
-          \${p.id === sessao.user.id ? '<span class="chip rev">voc\\u00ea</span>' : ''}
-          \${p.trocar_senha ? '<span class="chip and">senha provis\\u00f3ria</span>' : ''}</div>
+          \${p.id === sessao.user.id ? '<span class="chip rev">você</span>' : ''}
+          \${p.trocar_senha ? '<span class="chip and">senha provisória</span>' : ''}</div>
         <div class="sub">\${esc(p.email ?? '')}</div></div>
       <div style="min-width:140px">
         <div style="font-size:13.5px;font-weight:600">\${p.papel === 'administrador' ? 'Administrador' : 'Editor'}</div>
         <div class="sub" style="margin:0">\${esc(quando(p.ultimo_acesso))}</div></div>
       \${(souAdmin() || p.id === sessao.user.id) ? '<button class="btn sm" data-renomear>Renomear</button>' : ''}
-      \${souAdmin() ? '<button class="btn sm" data-acoes>A\\u00e7\\u00f5es</button>' : ''}
+      \${souAdmin() ? '<button class="btn sm" data-acoes>Ações</button>' : ''}
     </div>\`).join('')}</div>\`;
 
   const nova = document.getElementById('nova');
@@ -1907,7 +1908,7 @@ async function abaUsuarios(){
     b.onclick = (ev) => menuContexto(ev, [
       { texto:'Renomear', acao: () => renomear(p, linha) },
       { texto: p.papel === 'administrador' ? 'Tornar editor' : 'Tornar administrador', acao: () => mudarPapel(p) },
-      { texto:'Gerar senha provis\\u00f3ria', acao: () => novaSenha(p) },
+      { texto:'Gerar senha provisória', acao: () => novaSenha(p) },
       '-', { texto:'Excluir conta', perigo:true, acao: () => excluirPessoa(p) },
     ]);
   });
@@ -1979,12 +1980,12 @@ function formPessoa(){
 function mostrarSenha(nome, senha){
   const f = document.getElementById('formpessoa');
   f.innerHTML = \`<div class="aviso ok" style="margin:0 0 20px">
-    <p style="margin:0 0 14px">Conta de <b>\${esc(nome)}</b> pronta. Entregue a senha abaixo pessoalmente ou por um canal interno. A pessoa cria a pr\\u00f3pria senha ao entrar.</p>
+    <p style="margin:0 0 14px">Conta de <b>\${esc(nome)}</b> pronta. Entregue a senha abaixo pessoalmente ou por um canal interno. A pessoa cria a própria senha ao entrar.</p>
     <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
       <code class="chaveprov">\${esc(senha)}</code>
       <button class="btn" id="copiar">Copiar</button>
       <button class="btn ghost" id="pronto">Pronto</button></div>
-    <p style="margin:14px 0 0;font-size:12.5px">Esta senha aparece uma \\u00fanica vez. Fechando o aviso, n\\u00e3o h\\u00e1 como v\\u00ea-la de novo; s\\u00f3 gerar outra.</p></div>\`;
+    <p style="margin:14px 0 0;font-size:12.5px">Esta senha aparece uma única vez. Fechando o aviso, não há como vê-la de novo; só gerar outra.</p></div>\`;
   document.getElementById('copiar').onclick = async () => {
     try { await navigator.clipboard.writeText(senha); toast('Senha copiada'); }
     catch { toast('Copie manualmente'); }
@@ -1996,7 +1997,7 @@ async function mudarPapel(p){
   const papel = p.papel === 'administrador' ? 'editor' : 'administrador';
   try {
     await api('/api/usuarios', { method:'PATCH', body: JSON.stringify({ id:p.id, acao:'papel', papel }) });
-    abaUsuarios(); toast(\`\${p.nome} agora \\u00e9 \${papel}\`);
+    abaUsuarios(); toast(\`\${p.nome} agora é \${papel}\`);
   } catch (err) { toast(err.message); }
 }
 
@@ -2009,10 +2010,10 @@ async function novaSenha(p){
 }
 
 async function excluirPessoa(p){
-  if (!confirm(\`Excluir a conta de \${p.nome}? Isso n\\u00e3o pode ser desfeito.\`)) return;
+  if (!confirm(\`Excluir a conta de \${p.nome}? Isso não pode ser desfeito.\`)) return;
   try {
     await api('/api/usuarios', { method:'DELETE', body: JSON.stringify({ id:p.id }) });
-    abaUsuarios(); toast('Conta exclu\\u00edda');
+    abaUsuarios(); toast('Conta excluída');
   } catch (err) { toast(err.message); }
 }
 
@@ -2025,37 +2026,37 @@ async function abaAjustes(){
 
   c.innerHTML = \`<div class="topo"><div class="cresce"><h1>Ajustes</h1></div></div>
     <div class="cartao" style="margin-bottom:16px"><h2>Modo de teste</h2>
-      <p class="sub">\${modoTeste ? 'Ligado. S\\u00f3 as contas abaixo recebem mensagem; o resto \\u00e9 registrado e ignorado.'
+      <p class="sub">\${modoTeste ? 'Ligado. Só as contas abaixo recebem mensagem; o resto é registrado e ignorado.'
         : 'Desligado. Qualquer pessoa que comentar uma palavra-chave recebe mensagem.'}</p>
       \${souAdmin() ? \`<button class="btn \${modoTeste?'pri':''}" id="modo" style="margin-top:14px">\${modoTeste?'Desligar modo de teste':'Ligar modo de teste'}</button>\`
-        : '<p class="sub">S\\u00f3 administrador pode mudar.</p>'}</div>
+        : '<p class="sub">Só administrador pode mudar.</p>'}</div>
     <div class="cartao" style="margin-bottom:16px"><h2>Contas testadoras</h2>
-      <p class="sub" style="margin-bottom:14px">Quem recebe mensagem enquanto o modo de teste est\\u00e1 ligado.</p>
+      <p class="sub" style="margin-bottom:14px">Quem recebe mensagem enquanto o modo de teste está ligado.</p>
       \${(testadores ?? []).length ? \`<div class="lista">\${testadores.map((t) => \`<div class="linha">
         <div class="cresce">@\${esc(t.username)}</div>
         \${souAdmin() ? \`<button class="btn sm" data-remover="\${t.id}">Remover</button>\` : ''}</div>\`).join('')}</div>\`
         : '<p class="sub">Nenhuma conta cadastrada.</p>'}
       <div style="display:flex;gap:8px;margin-top:14px"><input id="novo" placeholder="mastercouto">
         <button class="btn pri" id="add" style="white-space:nowrap">Adicionar</button></div></div>
-    \${souAdmin() ? \`<div class="cartao" style="margin-bottom:16px"><h2>Dados das publica\\u00e7\\u00f5es</h2>
-      <p class="sub" style="margin-bottom:14px">Cataloga os posts de 2026, l\\u00ea alcance e intera\\u00e7\\u00f5es, e soma as palavras dos coment\\u00e1rios antigos. Roda 20 por vez; clique de novo at\\u00e9 a fila esvaziar. Evite rodar enquanto estiver testando o envio.</p>
+    \${souAdmin() ? \`<div class="cartao" style="margin-bottom:16px"><h2>Dados das publicações</h2>
+      <p class="sub" style="margin-bottom:14px">Cataloga os posts de 2026, lê alcance e interações, e soma as palavras dos comentários antigos. Roda 20 por vez; clique de novo até a fila esvaziar. Evite rodar enquanto estiver testando o envio.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn" data-sinc="posts">1. Catalogar publica\\u00e7\\u00f5es</button>
-        <button class="btn" data-sinc="metricas">2. Ler m\\u00e9tricas</button>
+        <button class="btn" data-sinc="posts">1. Catalogar publicações</button>
+        <button class="btn" data-sinc="metricas">2. Ler métricas</button>
         <button class="btn" data-sinc="palavras">3. Somar palavras</button>
       </div><div id="sincsaida"></div></div>\` : ''}
     <div class="cartao" style="margin-bottom:16px"><h2>Minha senha</h2>
-      <div style="display:flex;gap:8px;margin-top:12px"><input id="nsenha" type="password" autocomplete="new-password" placeholder="Nova senha, no m\\u00ednimo 8 caracteres">
+      <div style="display:flex;gap:8px;margin-top:12px"><input id="nsenha" type="password" autocomplete="new-password" placeholder="Nova senha, no mínimo 8 caracteres">
         <button class="btn pri" id="trocar" style="white-space:nowrap">Trocar</button></div></div>
-    <div class="cartao"><h2>Apar\\u00eancia</h2>
+    <div class="cartao"><h2>Aparência</h2>
       <p class="sub">Tema \${escuro?'escuro':'claro'}.</p>
       <button class="btn" id="tema" style="margin-top:14px">Usar tema \${escuro?'claro':'escuro'}</button></div>
-    <p class="sub" style="margin-top:22px">Comenta e Recebe, vers\\u00e3o ${VERSAO}</p>\`;
+    <p class="sub" style="margin-top:22px">Comenta e Recebe, versão ${VERSAO}</p>\`;
 
   const bmodo = document.getElementById('modo');
   if (bmodo) bmodo.onclick = async () => {
     const { error } = await sb.from('configuracoes').update({ valor: !modoTeste }).eq('chave','modo_teste');
-    if (error) return toast('S\\u00f3 administrador pode mudar o modo de teste');
+    if (error) return toast('Só administrador pode mudar o modo de teste');
     modoTeste = !modoTeste; desenhar();
     toast(modoTeste ? 'Modo de teste ligado' : 'Modo de teste desligado');
   };
@@ -2068,7 +2069,7 @@ async function abaAjustes(){
     const nova = document.getElementById('nsenha').value;
     if (nova.length < 8) return toast('A senha precisa de pelo menos 8 caracteres');
     const { error } = await sb.auth.updateUser({ password: nova });
-    toast(error ? 'N\\u00e3o foi poss\\u00edvel trocar: ' + error.message : 'Senha trocada');
+    toast(error ? 'Não foi possível trocar: ' + error.message : 'Senha trocada');
     if (!error) document.getElementById('nsenha').value = '';
   };
   document.getElementById('add').onclick = async () => {
@@ -2083,7 +2084,7 @@ async function abaAjustes(){
       if (!armado) { armado = true; b.classList.add('armado'); b.textContent = 'Confirmar';
         setTimeout(() => { armado = false; b.classList.remove('armado'); b.textContent = 'Remover'; }, 4000); return; }
       const { error } = await sb.from('testadores').delete().eq('id', b.dataset.remover);
-      if (error) return toast('S\\u00f3 administrador pode remover');
+      if (error) return toast('Só administrador pode remover');
       abaAjustes(); toast('Conta removida');
     };
   });
@@ -2091,7 +2092,7 @@ async function abaAjustes(){
     b.onclick = async () => {
       const saida = document.getElementById('sincsaida');
       const antes = b.textContent;
-      b.disabled = true; b.textContent = 'Rodando\\u2026';
+      b.disabled = true; b.textContent = 'Rodando…';
       try {
         const corpo = await api('/api/sincronizar?o=' + b.dataset.sinc + '&lote=20');
         saida.innerHTML = \`<div class="aviso info">\${esc(JSON.stringify(corpo))}</div>\`;
@@ -2105,3 +2106,4 @@ async function abaAjustes(){
 
 iniciar();
 </script></body></html>`;
+/* === fim do PAINEL === */
