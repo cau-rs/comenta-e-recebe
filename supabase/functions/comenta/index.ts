@@ -138,9 +138,14 @@ async function comentario(v: any, tempo: number, ctx: any) {
     return;
   }
 
-  if (!(await inserir({ ...comum, regra_id: regra.id, status: 'recebido' }))) return;
+  // Codigo proprio deste envio. E o que permite atribuir o clique a pessoa:
+  // sem ele, o link curto e o mesmo para todo mundo e so da para contar.
+  const codigoEnvio = novoCodigo();
 
-  const envio = await enviarDm(ctx, id, regra);
+  if (!(await inserir({ ...comum, regra_id: regra.id, status: 'recebido',
+                        codigo_envio: codigoEnvio }))) return;
+
+  const envio = await enviarDm(ctx, id, regra, codigoEnvio);
 
   await patch(`disparos?comment_id=eq.${encodeURIComponent(id)}`, {
     status: envio.status, erro: envio.erro,
@@ -272,13 +277,18 @@ function textoDaMensagem(bruto: string, rotulo: string, link: string) {
  *   sem rotulo -> texto com o link ORIGINAL a mostra (nao mede)
  * O template de botao nao funciona na versao web do Instagram.
  */
-async function enviarDm(ctx: any, commentId: string, regra: any) {
+async function enviarDm(ctx: any, commentId: string, regra: any, codigoEnvio?: string) {
   const destino = ctx.pageId ?? ctx.conta?.ig_user_id;
   const tokenPg = await tokenDaPagina(ctx.versao, ctx.pageId);
   const marca = tokenPg ? '[token da pagina]' : '[token do sistema]';
 
   const rotulo = (regra.rotulo_botao ?? '').trim();
-  const curto = regra.codigo_curto ? `${ctx.base}/r/${regra.codigo_curto}` : regra.link;
+  // O sufixo depois do hifen identifica ESTE envio, e e o que permite saber
+  // quem clicou. Sem ele o link ainda funciona, so nao tem dono.
+  const caminho = regra.codigo_curto
+    ? regra.codigo_curto + (codigoEnvio ? `-${codigoEnvio}` : '')
+    : null;
+  const curto = caminho ? `${ctx.base}/r/${caminho}` : regra.link;
   const texto = textoDaMensagem(regra.mensagem_dm, rotulo, regra.link);
 
   const message = rotulo
@@ -353,6 +363,17 @@ function senhaProvisoria() {
   const n = new Uint32Array(3);
   crypto.getRandomValues(n);
   return `${ADJ[n[0] % ADJ.length]}-${ADJ[n[1] % ADJ.length]}-${1000 + (n[2] % 9000)}`;
+}
+
+/**
+ * Codigo de um envio, usado no sufixo do link curto. Sorteado de verdade, nao
+ * derivado do id do disparo: assim ninguem descobre o link de outra pessoa
+ * adivinhando, e o endereco nao carrega informacao nenhuma sobre quem recebeu.
+ */
+function novoCodigo() {
+  const b = new Uint8Array(6);
+  crypto.getRandomValues(b);
+  return [...b].map((x) => x.toString(36).padStart(2, '0')).join('').slice(0, 10);
 }
 
 const admAuth = { 'content-type': 'application/json', apikey: SERVICE_KEY,
@@ -614,24 +635,54 @@ async function resumo(texto: string) {
   return [...new Uint8Array(b)].slice(0, 16).map((x) => x.toString(16).padStart(2, '0')).join('');
 }
 
-async function linkCurto(codigo: string, req: Request) {
-  if (!codigo) return txt('Nao encontrado', 404);
+/**
+ * O endereco tem duas formas:
+ *
+ *   /r/lcms2u            antigo, uma automacao inteira. Conta, nao atribui.
+ *   /r/lcms2u-a7f3k2     o sufixo identifica O ENVIO, e portanto a pessoa.
+ *
+ * A primeira continua valendo para sempre: quem recebeu antes da mudanca abre
+ * normalmente, so entra na contagem sem dono. Quebrar esses links significaria
+ * quebrar mensagens ja entregues.
+ */
+async function linkCurto(caminho: string, req: Request) {
+  if (!caminho) return txt('Nao encontrado', 404);
+
+  const hifen = caminho.indexOf('-');
+  const codigo = hifen === -1 ? caminho : caminho.slice(0, hifen);
+  const envio  = hifen === -1 ? ''      : caminho.slice(hifen + 1);
+
   const r = await sb(`regras?select=id,link&codigo_curto=eq.${encodeURIComponent(codigo)}&limit=1`);
   if (!r[0]) return txt('Link nao encontrado', 404);
+
+  // Quem e o dono deste clique. Se o codigo nao bater com nenhum envio, o
+  // clique e gravado assim mesmo, sem dono: perder a contagem seria pior.
+  let disparoId: string | null = null;
+  if (envio) {
+    const d = await sb(
+      `disparos?select=id&codigo_envio=eq.${encodeURIComponent(envio)}&limit=1`
+    ).catch(() => []);
+    disparoId = d[0]?.id ?? null;
+  }
 
   const agente = req.headers.get('user-agent') ?? '';
   const ip = req.headers.get('cf-connecting-ip')
     ?? (req.headers.get('x-forwarded-for') ?? '').split(',')[0].trim();
   const hash = await resumo(`${ip}|${agente}`);
 
+  // A janela anti-repeticao fecha sobre o envio quando ele e conhecido. Por
+  // automacao, duas pessoas atras do mesmo IP se anulariam.
   const desde = new Date(Date.now() - JANELA_CLIQUE * 1000).toISOString();
+  const alvo = disparoId
+    ? `disparo_id=eq.${disparoId}`
+    : `regra_id=eq.${r[0].id}&disparo_id=is.null`;
   const antes = await sb(
-    `cliques?select=id&regra_id=eq.${r[0].id}&origem_hash=eq.${hash}&criado_em=gte.${desde}&limit=1`
+    `cliques?select=id&${alvo}&origem_hash=eq.${hash}&criado_em=gte.${desde}&limit=1`
   ).catch(() => []);
 
   if (!antes.length) {
     await post('cliques', {
-      regra_id: r[0].id, origem: 'dm',
+      regra_id: r[0].id, disparo_id: disparoId, origem: 'dm',
       agente: agente.slice(0, 300), origem_hash: hash,
     });
   }
@@ -1150,7 +1201,7 @@ function telaEntrar(msg, tipo){
   };
 }
 
-const ABAS = { automacoes:'Automações', desempenho:'Desempenho', usuarios:'Usuários', ajustes:'Ajustes' };
+const ABAS = { automacoes:'Automações', desempenho:'Desempenho', pessoas:'Pessoas', usuarios:'Usuários', ajustes:'Ajustes' };
 
 function desenhar(){
   app.innerHTML = \`<div class="layout">
@@ -1175,7 +1226,8 @@ function desenhar(){
   document.getElementById('sair').onclick = async () => { await sb.auth.signOut(); location.reload(); };
   const fab = document.getElementById('fab');
   if (fab) fab.onclick = () => assistente();
-  ({ automacoes: abaAutomacoes, desempenho: abaDesempenho, usuarios: abaUsuarios, ajustes: abaAjustes })[aba]();
+  ({ automacoes: abaAutomacoes, desempenho: abaDesempenho, pessoas: abaPessoas,
+     usuarios: abaUsuarios, ajustes: abaAjustes })[aba]();
 }
 
 function tarja(){
@@ -1859,6 +1911,179 @@ async function abaDesempenho(){
     a.download = \`desempenho-caurs-\${periodo}d.csv\`; a.click();
     toast(\`Planilha com \${linhas.length} publicações\`);
   };
+}
+
+/* ------------------------------------------------------------- pessoas */
+
+/**
+ * O funil individual: comentou, recebeu, clicou.
+ *
+ * Só aparece quem acionou uma automação. Comentário que não aciona tem autor e
+ * texto descartados pelo gatilho do banco, de propósito, e continua assim.
+ *
+ * Clique por pessoa só existe para mensagens enviadas depois de 03/11/2026,
+ * quando o link curto passou a carregar um código por envio. Antes disso o
+ * endereço era o mesmo para todo mundo e não havia a quem atribuir, então
+ * esses aparecem como "não medido", que é diferente de "não clicou".
+ */
+let pPeriodo = 90, pFiltro = 'todos', pRegra = 'todas';
+
+const CORTE_ATRIBUICAO = '2026-11-03';
+
+async function abaPessoas(){
+  const c = document.getElementById('conteudo');
+  c.innerHTML = tarja() + '<p class="sub">Carregando…</p>';
+  ligarTarja();
+
+  const desde = new Date(Date.now() - pPeriodo * 86400000).toISOString();
+  const [{ data: linhas, error }, { data: regras }] = await Promise.all([
+    sb.from('funil_por_pessoa').select('*').gte('comentado_em', desde)
+      .order('comentado_em', { ascending: false }).limit(2000),
+    sb.from('regras').select('id,nome').order('nome'),
+  ]);
+  if (error) {
+    c.innerHTML = tarja() + \`<div class="aviso">Não foi possível carregar: \${esc(error.message)}</div>\`;
+    return ligarTarja();
+  }
+
+  const todas = linhas ?? [];
+  const medido = (l) => l.enviado_em && l.enviado_em >= CORTE_ATRIBUICAO;
+
+  const visiveis = todas.filter((l) =>
+    (pRegra === 'todas' || l.regra_id === pRegra) &&
+    (pFiltro === 'todos'
+      || (pFiltro === 'clicaram'   && l.clicou)
+      || (pFiltro === 'receberam'  && l.recebeu && !l.clicou && medido(l))
+      || (pFiltro === 'nao_receberam' && !l.recebeu)));
+
+  const semCatalogo = todas.filter((l) => l.publicacao === 'Não catalogada').length;
+  const comentaram = todas.length;
+  const receberam  = todas.filter((l) => l.recebeu).length;
+  const clicaram   = todas.filter((l) => l.clicou).length;
+  const atribuiveis = todas.filter(medido).length;
+  const pessoas = new Set(todas.map((l) => l.username)).size;
+
+  const pct = (a, b) => b ? Math.round(100 * a / b) + '%' : '—';
+
+  c.innerHTML = tarja() + \`<div class="topo"><div class="cresce"><h1>Pessoas</h1>
+      <p>Quem comentou, quem recebeu a mensagem e quem abriu o link.</p></div>
+      <button class="btn" id="csv">Baixar planilha</button></div>
+
+    <div class="pastas">
+      <span class="sub" style="margin:0;font-weight:600">Período</span>
+      <button class="chipsel mini" data-pper="30" aria-pressed="\${pPeriodo===30}">30 dias</button>
+      <button class="chipsel mini" data-pper="90" aria-pressed="\${pPeriodo===90}">90 dias</button>
+      <button class="chipsel mini" data-pper="365" aria-pressed="\${pPeriodo===365}">Este ano</button>
+    </div>
+
+    <div class="numeros">
+      <div class="numero"><b class="grande">\${num(comentaram)}</b><span>comentários atendidos</span>
+        <em style="color:var(--tx2);font-weight:400">\${num(pessoas)} pessoas distintas</em></div>
+      <div class="numero"><b>\${num(receberam)}</b><span>receberam a mensagem</span>
+        <em style="color:var(--tx2);font-weight:400">\${pct(receberam, comentaram)} de quem comentou</em></div>
+      <div class="numero"><b>\${num(clicaram)}</b><span>abriram o link</span>
+        <em style="color:var(--tx2);font-weight:400">\${pct(clicaram, atribuiveis)} de quem foi medido</em></div>
+    </div>
+
+    \${atribuiveis < receberam ? \`<div class="aviso info">
+      \${num(receberam - atribuiveis)} mensagens foram enviadas antes de o sistema passar a
+      identificar quem clica. Elas entram na contagem de envio, mas aparecem como
+      <b>não medido</b> na coluna do link, que é diferente de não ter clicado.</div>\` : ''}
+
+    \${semCatalogo ? \`<div class="aviso info">\${num(semCatalogo)} linhas aparecem como
+      <b>não catalogada</b> na coluna da publicação. Não afeta os números; é só o
+      catálogo de posts desatualizado. Em Ajustes, rode <b>Catalogar publicações</b>.</div>\` : ''}
+
+    <div class="pastas">
+      <button class="chipsel mini" data-pf="todos" aria-pressed="\${pFiltro==='todos'}">Todos</button>
+      <button class="chipsel mini" data-pf="clicaram" aria-pressed="\${pFiltro==='clicaram'}">Abriram o link</button>
+      <button class="chipsel mini" data-pf="receberam" aria-pressed="\${pFiltro==='receberam'}">Receberam e não abriram</button>
+      <button class="chipsel mini" data-pf="nao_receberam" aria-pressed="\${pFiltro==='nao_receberam'}">Não receberam</button>
+      <label class="sub" style="margin:0 0 0 8px" for="pregra">Automação</label>
+      <select id="pregra" style="width:auto;min-height:44px">
+        <option value="todas">Todas</option>
+        \${(regras ?? []).map((r) => \`<option value="\${r.id}" \${pRegra===r.id?'selected':''}>\${esc(r.nome)}</option>\`).join('')}
+      </select>
+      <span class="sub" style="margin:0;margin-left:auto">\${visiveis.length} linhas</span>
+    </div>
+
+    \${visiveis.length ? \`<div class="lista rolavel"><table>
+      <thead><tr>
+        <th>Pessoa</th><th>Comentou</th><th>Automação</th><th>Publicação</th>
+        <th>Recebeu</th><th>Abriu o link</th><th class="n">Até abrir</th>
+      </tr></thead>
+      <tbody>\${visiveis.slice(0, 300).map(linhaPessoa).join('')}</tbody>
+    </table></div>
+    <p class="sub" style="margin-top:12px">Mostrando até 300; a planilha traz todas.
+      Quem comentou sem acionar nenhuma automação não aparece aqui: desses, o sistema
+      não guarda autor nem texto.</p>\`
+      : '<div class="vazio"><b>Ninguém neste recorte</b><span>Troque o período, o filtro ou a automação.</span></div>'}
+
+    <div class="cartao" style="margin-top:26px">
+      <h3>Sobre estes dados</h3>
+      <p class="sub">Esta tela mostra dado pessoal: nome de usuário, o que a pessoa
+      pediu e quando abriu. Use para atendimento e para medir, não para outra
+      finalidade. O sistema apaga automaticamente nome, identificador e texto do
+      comentário depois do prazo definido em Ajustes, mantendo só os números.</p>
+    </div>\`;
+  ligarTarja();
+
+  c.querySelectorAll('[data-pper]').forEach((b) => { b.onclick = () => { pPeriodo = Number(b.dataset.pper); abaPessoas(); }; });
+  c.querySelectorAll('[data-pf]').forEach((b) => { b.onclick = () => { pFiltro = b.dataset.pf; abaPessoas(); }; });
+  document.getElementById('pregra').onchange = (ev) => { pRegra = ev.target.value; abaPessoas(); };
+
+  document.getElementById('csv').onclick = () => {
+    const cab = ['Pessoa','Comentou em','Comentario','Automacao','Publicacao','Link do post',
+                 'Recebeu','Enviado em','Abriu o link','Abriu em','Aberturas','Segundos ate abrir'];
+    const linhasCsv = visiveis.map((l) => [
+      '@' + (l.username ?? ''), l.comentado_em ?? '', (l.texto_comentario ?? '').replace(/[\\r\\n]+/g,' '),
+      l.automacao ?? '', l.publicacao ?? '', l.permalink ?? '',
+      l.recebeu ? 'sim' : 'nao', l.enviado_em ?? '',
+      !medido(l) ? 'nao medido' : (l.clicou ? 'sim' : 'nao'),
+      l.primeiro_clique ?? '', l.aberturas ?? 0, l.segundos_ate_clicar ?? '',
+    ]);
+    const tudo = [cab, ...linhasCsv]
+      .map((r) => r.map((v) => '"' + String(v ?? '').replace(/"/g,'""') + '"').join(';')).join('\\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['\\ufeff' + tudo], { type:'text/csv;charset=utf-8' }));
+    a.download = \`pessoas-caurs-\${pPeriodo}d.csv\`; a.click();
+    toast(\`Planilha com \${linhasCsv.length} linhas\`);
+  };
+}
+
+function linhaPessoa(l){
+  const medido = l.enviado_em && l.enviado_em >= CORTE_ATRIBUICAO;
+  const quandoCurto = (iso) => iso
+    ? new Date(iso).toLocaleDateString('pt-BR',{day:'2-digit',month:'short'})
+      + ' ' + new Date(iso).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})
+    : '—';
+  const espera = (s) => s == null ? '—'
+    : s < 90 ? \`\${s}s\`
+    : s < 5400 ? \`\${Math.round(s/60)} min\`
+    : s < 172800 ? \`\${Math.round(s/3600)} h\`
+    : \`\${Math.round(s/86400)} d\`;
+
+  const recebeu = l.recebeu
+    ? '<span class="chip ok">sim</span>'
+    : \`<span class="chip late" title="\${esc(l.status ?? '')}">\${esc(l.status ?? 'não')}</span>\`;
+
+  const abriu = !l.recebeu ? '<span class="chip">—</span>'
+    : !medido ? '<span class="chip" title="Enviada antes de o sistema identificar quem clica">não medido</span>'
+    : l.clicou
+      ? \`<span class="chip ok">\${quandoCurto(l.primeiro_clique)}\${l.aberturas > 1 ? \` · \${l.aberturas}x\` : ''}</span>\`
+      : '<span class="chip">não</span>';
+
+  return \`<tr>
+    <td><b>@\${esc(l.username ?? '')}</b></td>
+    <td>\${quandoCurto(l.comentado_em)}</td>
+    <td class="titulo" style="min-width:160px">\${esc(l.automacao ?? '—')}</td>
+    <td class="titulo" style="min-width:200px">\${l.permalink
+      ? \`<a href="\${esc(l.permalink)}" target="_blank" rel="noopener" style="color:var(--acc-tx)">\${esc(l.publicacao || 'ver post')}</a>\`
+      : esc(l.publicacao || '—')}</td>
+    <td>\${recebeu}</td>
+    <td>\${abriu}</td>
+    <td class="n">\${espera(l.segundos_ate_clicar)}</td>
+  </tr>\`;
 }
 
 /* ------------------------------------------------------------ usuarios */

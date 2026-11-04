@@ -81,6 +81,13 @@ falhar com comentário real é o cenário normal.
 **A Meta não reporta comentário de quem administra a conta.** Teste com conta
 externa, ou o webhook simplesmente não chega.
 
+**Clique por pessoa depende do sufixo no link.** O endereço curto tem duas
+formas: `/r/lcms2u` é por automação e só conta; `/r/lcms2u-a7f3k2` tem um
+código por envio e permite saber quem abriu. A forma antiga continua valendo,
+para não quebrar mensagens já entregues, mas entra na contagem sem dono. Isso
+começou em 03/11/2026: antes disso o painel mostra **não medido**, que é
+diferente de não ter clicado.
+
 **O rastreador da Meta infla os cliques.** Ele abre o link curto assim que a DM
 é montada, de vários servidores: numa medição foram seis máquinas para um
 humano, e a taxa passou de 600%. A classificação de robô vive no gatilho
@@ -100,6 +107,27 @@ levam até 48 horas para consolidar.
 
 **O Worker do Cloudflare converte o content-type.** O Supabase serve HTML como
 texto puro. Sem o Worker, o painel aparece como código na tela.
+
+## Dado pessoal e retenção
+
+A aba **Pessoas** mostra quem comentou, quem recebeu e quem abriu o link. Isso
+é dado pessoal: nome de usuário, o que a pessoa pediu e quando acessou. Não é
+dado sensível na definição da LGPD, que reserva o termo para origem racial,
+saúde e convicção, mas a lei se aplica mesmo assim.
+
+O que o sistema **não** guarda, de propósito: autor e texto de comentário que
+não aciona nenhuma automação. O gatilho do banco apaga esses campos e mantém só
+a contagem agregada de palavras.
+
+A função `anonimizar_antigos()` apaga nome, identificador, texto do comentário
+e o agente do navegador depois do prazo em `configuracoes.retencao_meses`,
+hoje 12. Ela **mantém a linha**: os números de desempenho continuam inteiros e
+só o rastro individual some. Apagar a linha destruiria o histórico junto.
+
+A rotina ainda não é automática. Até ser, alguém precisa chamá-la.
+
+O aviso de privacidade publicado no site precisa refletir isso. Enquanto não
+refletir, há descompasso entre o que o sistema faz e o que foi informado.
 
 ## Segredos
 
